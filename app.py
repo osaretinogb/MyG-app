@@ -1,3 +1,4 @@
+from supabase import create_client
 import os
 import json
 import re
@@ -138,10 +139,121 @@ def init_session_state():
     if "page" not in st.session_state:
         st.session_state.page = "goal_setup"
 
+    if "current_plan_id" not in st.session_state:
+        st.session_state.current_plan_id = None
+
+    if "user" not in st.session_state:
+        st.session_state.user = None
+
+    if "session" not in st.session_state:
+        st.session_state.session = None
+
+    if "auth_mode" not in st.session_state:
+        st.session_state.auth_mode = "Login"
+
+
+
 
 # -----------------------------
 # OpenAI Helpers
 # -----------------------------
+def show_login_page():
+    st.title("🔐 MyG Accountability App")
+    st.caption("Public Beta")
+
+    st.info(
+        "Create an account or log in to save your goals, plans, and progress."
+    )
+
+    if supabase is None:
+        st.error("Supabase is not configured. Login cannot work until Supabase keys are added.")
+        st.stop()
+
+    auth_mode = st.radio(
+        "Choose an option",
+        ["Login", "Sign Up"],
+        horizontal=True,
+        key="auth_mode_radio"
+    )
+
+    email = st.text_input("Email")
+    password = st.text_input("Password", type="password")
+
+    if auth_mode == "Sign Up":
+        confirm_password = st.text_input("Confirm Password", type="password")
+
+        if st.button("Create Account"):
+            if not email or not password or not confirm_password:
+                st.warning("Please enter your email, password, and confirmation password.")
+                return
+
+            if password != confirm_password:
+                st.warning("Passwords do not match.")
+                return
+
+            if len(password) < 6:
+                st.warning("Password should be at least 6 characters.")
+                return
+
+            try:
+                response = supabase.auth.sign_up({
+                    "email": email,
+                    "password": password,
+                })
+
+                if response.user:
+                    st.success("Account created successfully.")
+
+                    if response.session:
+                        st.session_state.user = response.user
+                        st.session_state.session = response.session
+                        st.rerun()
+                    else:
+                        st.info("Check your email to confirm your account before logging in.")
+
+                else:
+                    st.warning("Account creation did not complete. Please try again.")
+
+            except Exception as e:
+                st.error(f"Sign up failed: {e}")
+
+    else:
+        if st.button("Login"):
+            if not email or not password:
+                st.warning("Please enter your email and password.")
+                return
+
+            try:
+                response = supabase.auth.sign_in_with_password({
+                    "email": email,
+                    "password": password,
+                })
+
+                if response.user and response.session:
+                    st.session_state.user = response.user
+                    st.session_state.session = response.session
+                    st.success("Logged in successfully.")
+                    st.rerun()
+                else:
+                    st.warning("Login failed. Please check your email and password.")
+
+            except Exception as e:
+                st.error(f"Login failed: {e}")
+
+def logout_user():
+    try:
+        if supabase is not None:
+            supabase.auth.sign_out()
+    except Exception:
+        pass
+
+    st.session_state.user = None
+    st.session_state.session = None
+    st.session_state.page = "goal_setup"
+    st.session_state.plan = None
+    st.session_state.current_plan_id = None
+    st.rerun()
+
 def call_model(user_prompt: str) -> str:
     """
     Sends full conversation history plus the newest user prompt.
@@ -389,7 +501,14 @@ def show_daily_checkin_page():
 
     with col1:
         if st.button("Save Check-In"):
-            st.success("Check-in saved for this session.")
+            if st.session_state.current_plan_id:
+                update_step_progress_in_supabase(
+                    st.session_state.current_plan_id,
+                    st.session_state.plan["steps"]
+                )
+                st.success("Check-in saved permanently.")
+            else:
+                st.warning("This plan has not been saved to Supabase yet. Your check-in is saved only for this session.")
 
     with col2:
         if st.button("Back to Plan"):
@@ -405,13 +524,173 @@ def show_daily_checkin_page():
 
     show_feedback_link("bottom")
 
+def get_secret_value(key):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return os.getenv(key)
+
+
+supabase_url = get_secret_value("SUPABASE_URL")
+supabase_key = get_secret_value("SUPABASE_ANON_KEY")
+
+if not supabase_url or not supabase_key:
+    st.warning("Supabase is not configured yet. Plans will not be saved permanently.")
+    supabase = None
+else:
+    supabase = create_client(supabase_url, supabase_key)
+
+
+def save_plan_to_supabase(plan, user_id):
+    if supabase is None:
+        st.error("Supabase is not configured, so the plan could not be saved.")
+        return None
+
+    plan_payload = {
+        "user_id": user_id,
+        "goal_summary": plan.get("goal_summary", ""),
+        "smart_goal": plan.get("smart_goal", {}),
+        "overall_deadline": plan.get("overall_deadline", ""),
+        "likely_obstacle": plan.get("likely_obstacle", ""),
+        "today_next_action": plan.get("today_next_action", "")
+    }
+
+    plan_response = supabase.table("plans").insert(plan_payload).execute()
+
+    if not plan_response.data:
+        st.error("Plan could not be saved.")
+        return None
+
+    plan_id = plan_response.data[0]["id"]
+
+    step_rows = []
+
+    for step in plan.get("steps", []):
+        step_rows.append({
+            "plan_id": plan_id,
+            "step_number": step.get("step_number"),
+            "step_name": step.get("step_name", ""),
+            "description": step.get("description", ""),
+            "time_block": step.get("time_block", ""),
+            "deadline": step.get("deadline", ""),
+            "accountability_check": step.get("accountability_check", ""),
+            "status": step.get("status", "Not Started"),
+            "notes": step.get("notes", "")
+        })
+
+    if step_rows:
+        supabase.table("plan_steps").insert(step_rows).execute()
+
+    return plan_id
+
+def load_plan_from_supabase(plan_id):
+    if supabase is None:
+        st.error("Supabase is not configured.")
+        return None
+
+    plan_response = (
+        supabase.table("plans")
+        .select("*")
+        .eq("id", plan_id)
+        .single()
+        .execute()
+    )
+
+    if not plan_response.data:
+        st.error("No plan found with that Plan ID.")
+        return None
+
+    steps_response = (
+        supabase.table("plan_steps")
+        .select("*")
+        .eq("plan_id", plan_id)
+        .order("step_number")
+        .execute()
+    )
+
+    plan_data = plan_response.data
+    steps_data = steps_response.data or []
+
+    return {
+        "goal_summary": plan_data.get("goal_summary", ""),
+        "smart_goal": plan_data.get("smart_goal", {}),
+        "overall_deadline": plan_data.get("overall_deadline", ""),
+        "likely_obstacle": plan_data.get("likely_obstacle", ""),
+        "today_next_action": plan_data.get("today_next_action", ""),
+        "steps": [
+            {
+                "step_number": step.get("step_number"),
+                "step_name": step.get("step_name", ""),
+                "description": step.get("description", ""),
+                "time_block": step.get("time_block", ""),
+                "deadline": step.get("deadline", ""),
+                "accountability_check": step.get("accountability_check", ""),
+                "status": step.get("status", "Not Started"),
+                "notes": step.get("notes", "")
+            }
+            for step in steps_data
+        ]
+    }
+
+def update_step_progress_in_supabase(plan_id, steps):
+    if supabase is None:
+        st.warning("Supabase is not configured. Progress was saved only for this session.")
+        return
+
+    for step in steps:
+        step_number = step.get("step_number")
+
+        supabase.table("plan_steps").update({
+            "status": step.get("status", "Not Started"),
+            "notes": step.get("notes", "")
+        }).eq("plan_id", plan_id).eq("step_number", step_number).execute()
+
+def get_user_plans(user_id):
+    if supabase is None:
+        return []
+
+    response = (
+        supabase.table("plans")
+        .select("id, created_at, goal_summary, overall_deadline")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    return response.data or []
+
+def restore_supabase_session():
+    if supabase is None:
+        return
+
+    session = st.session_state.get("session")
+
+    if session:
+        try:
+            supabase.auth.set_session(
+                session.access_token,
+                session.refresh_token
+            )
+        except Exception as e:
+            st.warning(f"Could not restore Supabase session: {e}")
 
 # -----------------------------
 # UI
 # -----------------------------
 init_session_state()
+restore_supabase_session()
+
+if st.session_state.user is None:
+    show_login_page()
+    st.stop()
 
 st.sidebar.title("Navigation")
+
+if st.session_state.user:
+    st.sidebar.success(f"Logged in as: {st.session_state.user.email}")
+
+    if st.sidebar.button("Logout"):
+        logout_user()
 
 selected_page = st.sidebar.radio(
     "Go to",
@@ -424,9 +703,41 @@ if selected_page == "Goal Setup":
 else:
     st.session_state.page = "daily_checkin"
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("My Saved Plans")
+
+user_plans = get_user_plans(st.session_state.user.id)
+
+if user_plans:
+    plan_options = {
+        f"{plan['goal_summary']} — {plan.get('overall_deadline', '')}": plan["id"]
+        for plan in user_plans
+    }
+
+    selected_plan_label = st.sidebar.selectbox(
+        "Choose a saved plan",
+        list(plan_options.keys())
+    )
+
+    if st.sidebar.button("Load Selected Plan"):
+        selected_plan_id = plan_options[selected_plan_label]
+
+        loaded_plan = load_plan_from_supabase(selected_plan_id)
+
+        if loaded_plan:
+            st.session_state.plan = loaded_plan
+            st.session_state.current_plan_id = selected_plan_id
+            st.session_state.page = "daily_checkin"
+            st.sidebar.success("Plan loaded.")
+            st.rerun()
+else:
+    st.sidebar.caption("No saved plans yet.")
+
 if st.session_state.page == "daily_checkin":
     show_daily_checkin_page()
     st.stop()
+
+
 
 st.set_page_config(
     page_title="Accountability Goal Tracker",
@@ -626,6 +937,21 @@ if st.session_state.plan:
                         st.rerun()
                     except Exception as e:
                         st.error(f"Could not regenerate plan: {e}")
+
+st.subheader("Save Your Plan")
+
+if st.button("Save Plan"):
+    user_id = st.session_state.user.id
+
+    plan_id = save_plan_to_supabase(
+        st.session_state.plan,
+        user_id
+    )
+
+    if plan_id:
+        st.session_state.current_plan_id = plan_id
+        st.success("Plan saved successfully.")
+        st.code(plan_id)
 
 
 # -----------------------------
