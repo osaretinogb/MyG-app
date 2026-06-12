@@ -172,6 +172,10 @@ def show_login_page():
     st.title("🔐 MyG Accountability App")
     st.caption("Public Beta")
 
+    st.warning(
+    "Public Beta: This app is still being improved. Please do not enter highly sensitive personal information. "
+    "Use it for goal planning and accountability testing.")
+
     st.info(
         "Create an account or log in to save your goals, plans, and progress."
     )
