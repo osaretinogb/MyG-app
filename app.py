@@ -2,7 +2,7 @@ from supabase import create_client
 import os
 import json
 import re
-from datetime import datetime
+from datetime import datetime, date
 from typing import Dict, List, Any
 
 import pandas as pd
@@ -29,6 +29,12 @@ if not api_key:
 client = OpenAI(api_key=api_key)
 
 MODEL_NAME = "gpt-5.5"
+
+# Usage limits
+MAX_PLAN_GENERATIONS_PER_DAY = 3
+MAX_PLAN_REGENERATIONS_PER_DAY = 5
+MAX_GOAL_CHARACTERS = 500
+MAX_CLARIFICATION_CHARACTERS = 800
 
 FEEDBACK_FORM_URL = "https://forms.gle/KV3b9NiTWuHetsHf8"
 
@@ -137,10 +143,13 @@ def init_session_state():
         st.session_state.clarification_notes = ""
 
     if "page" not in st.session_state:
-        st.session_state.page = "goal_setup"
+        st.session_state.page = "my_plans"
 
     if "current_plan_id" not in st.session_state:
         st.session_state.current_plan_id = None
+
+    if "plan_loaded_for_editing" not in st.session_state:
+        st.session_state.plan_loaded_for_editing = False
 
     if "user" not in st.session_state:
         st.session_state.user = None
@@ -150,6 +159,8 @@ def init_session_state():
 
     if "auth_mode" not in st.session_state:
         st.session_state.auth_mode = "Login"
+
+
 
 
 
@@ -207,6 +218,8 @@ def show_login_page():
                     if response.session:
                         st.session_state.user = response.user
                         st.session_state.session = response.session
+                        restore_supabase_session()
+                        set_start_page_after_login()
                         st.rerun()
                     else:
                         st.info("Check your email to confirm your account before logging in.")
@@ -232,6 +245,8 @@ def show_login_page():
                 if response.user and response.session:
                     st.session_state.user = response.user
                     st.session_state.session = response.session
+                    restore_supabase_session()
+                    set_start_page_after_login()
                     st.success("Logged in successfully.")
                     st.rerun()
                 else:
@@ -239,6 +254,8 @@ def show_login_page():
 
             except Exception as e:
                 st.error(f"Login failed: {e}")
+
+#----------------------------------------------------
 
 def logout_user():
     try:
@@ -253,6 +270,8 @@ def logout_user():
     st.session_state.plan = None
     st.session_state.current_plan_id = None
     st.rerun()
+
+#-----------------------------------------------------
 
 def call_model(user_prompt: str) -> str:
     """
@@ -280,6 +299,7 @@ def call_model(user_prompt: str) -> str:
 
     return assistant_text
 
+#------------------------------------------------------------
 
 def extract_json(text: str) -> Dict[str, Any]:
     """
@@ -383,10 +403,13 @@ Return JSON in this exact structure:
     response_text = call_model(prompt)
     return extract_json(response_text)
 
+#-----------------------------------------------
 
 def plan_to_dataframe(plan: Dict[str, Any]) -> pd.DataFrame:
     steps = plan.get("steps", [])
     return pd.DataFrame(steps)
+
+#---------------------------------------------------------
 
 def show_feedback_link(position="top"):
     if position == "top":
@@ -414,6 +437,7 @@ def show_feedback_link(position="top"):
             unsafe_allow_html=True
         )
 
+#---------------------------------------------------------
     
 def show_daily_checkin_page():
 
@@ -524,6 +548,8 @@ def show_daily_checkin_page():
 
     show_feedback_link("bottom")
 
+#-----------------------------------------------------------
+
 def get_secret_value(key):
     try:
         return st.secrets[key]
@@ -540,6 +566,7 @@ if not supabase_url or not supabase_key:
 else:
     supabase = create_client(supabase_url, supabase_key)
 
+#----------------------------------------------------------
 
 def save_plan_to_supabase(plan, user_id):
     if supabase is None:
@@ -582,6 +609,8 @@ def save_plan_to_supabase(plan, user_id):
         supabase.table("plan_steps").insert(step_rows).execute()
 
     return plan_id
+
+#-------------------------------------------------------
 
 def load_plan_from_supabase(plan_id):
     if supabase is None:
@@ -632,6 +661,8 @@ def load_plan_from_supabase(plan_id):
         ]
     }
 
+#-------------------------------------------------------
+
 def update_step_progress_in_supabase(plan_id, steps):
     if supabase is None:
         st.warning("Supabase is not configured. Progress was saved only for this session.")
@@ -645,19 +676,8 @@ def update_step_progress_in_supabase(plan_id, steps):
             "notes": step.get("notes", "")
         }).eq("plan_id", plan_id).eq("step_number", step_number).execute()
 
-def get_user_plans(user_id):
-    if supabase is None:
-        return []
 
-    response = (
-        supabase.table("plans")
-        .select("id, created_at, goal_summary, overall_deadline")
-        .eq("user_id", user_id)
-        .order("created_at", desc=True)
-        .execute()
-    )
-
-    return response.data or []
+#-----------------------------------------------
 
 def restore_supabase_session():
     if supabase is None:
@@ -673,6 +693,277 @@ def restore_supabase_session():
             )
         except Exception as e:
             st.warning(f"Could not restore Supabase session: {e}")
+
+#---------------------------------------------------
+
+def delete_plan_from_supabase(plan_id):
+    if supabase is None:
+        st.error("Supabase is not configured.")
+        return False
+
+    try:
+        supabase.table("plans").delete().eq("id", plan_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"Could not delete plan: {e}")
+        return False
+
+#--------------------------------------------------
+
+def update_existing_plan_in_supabase(plan_id, plan):
+    if supabase is None:
+        st.error("Supabase is not configured.")
+        return False
+
+    try:
+        plan_payload = {
+            "goal_summary": plan.get("goal_summary", ""),
+            "smart_goal": plan.get("smart_goal", {}),
+            "overall_deadline": plan.get("overall_deadline", ""),
+            "likely_obstacle": plan.get("likely_obstacle", ""),
+            "today_next_action": plan.get("today_next_action", "")
+        }
+
+        supabase.table("plans").update(plan_payload).eq("id", plan_id).execute()
+
+        # Simple MVP approach:
+        # Delete old steps, then reinsert current edited steps.
+        supabase.table("plan_steps").delete().eq("plan_id", plan_id).execute()
+
+        step_rows = []
+
+        for step in plan.get("steps", []):
+            step_rows.append({
+                "plan_id": plan_id,
+                "step_number": step.get("step_number"),
+                "step_name": step.get("step_name", ""),
+                "description": step.get("description", ""),
+                "time_block": step.get("time_block", ""),
+                "deadline": step.get("deadline", ""),
+                "accountability_check": step.get("accountability_check", ""),
+                "status": step.get("status", "Not Started"),
+                "notes": step.get("notes", "")
+            })
+
+        if step_rows:
+            supabase.table("plan_steps").insert(step_rows).execute()
+
+        return True
+
+    except Exception as e:
+        st.error(f"Could not update plan: {e}")
+        return False
+
+#---------------------------------------------------
+
+def get_user_plans(user_id):
+    if supabase is None:
+        return []
+
+    response = (
+        supabase.table("plans")
+        .select("id, created_at, goal_summary, overall_deadline, likely_obstacle, today_next_action")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    return response.data or []
+
+#------------------------------------------
+
+def show_my_plans_page():
+    show_feedback_link("top")
+
+    st.title("📋 My Plans")
+    st.write("Manage your saved accountability plans or create a new one.")
+
+    user_id = st.session_state.user.id
+    user_plans = get_user_plans(user_id)
+
+    if not user_plans:
+        st.info("You do not have any saved plans yet. Create your first plan to get started.")
+
+        if st.button("Create My First Plan"):
+            st.session_state.page = "goal_setup"
+            st.session_state.plan = None
+            st.session_state.current_plan_id = None
+            st.session_state.smart_suggestions = {}
+            st.session_state.smart_inputs = {
+                "specific": "",
+                "measurable": "",
+                "achievable": "",
+                "relevant": "",
+                "time_bound": "",
+            }
+            st.rerun()
+
+        show_feedback_link("bottom")
+        return
+
+    col_new, col_refresh = st.columns(2)
+
+    with col_new:
+        if st.button("➕ Create New Plan"):
+            st.session_state.page = "goal_setup"
+            st.session_state.plan = None
+            st.session_state.current_plan_id = None
+            st.session_state.goal = ""
+            st.session_state.smart_suggestions = {}
+            st.session_state.smart_inputs = {
+                "specific": "",
+                "measurable": "",
+                "achievable": "",
+                "relevant": "",
+                "time_bound": "",
+            }
+            st.rerun()
+
+    with col_refresh:
+        if st.button("🔄 Refresh Plans"):
+            st.rerun()
+
+    st.markdown("---")
+
+    for plan in user_plans:
+        with st.container():
+            st.subheader(plan.get("goal_summary", "Untitled Plan"))
+
+            st.write(f"**Deadline:** {plan.get('overall_deadline', 'No deadline')}")
+            st.write(f"**Next Action:** {plan.get('today_next_action', 'No next action')}")
+            st.caption(f"Created: {plan.get('created_at', '')}")
+
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                if st.button("Open Tracker", key=f"open_{plan['id']}"):
+                    loaded_plan = load_plan_from_supabase(plan["id"])
+
+                    if loaded_plan:
+                        st.session_state.plan = loaded_plan
+                        st.session_state.current_plan_id = plan["id"]
+                        st.session_state.page = "daily_checkin"
+                        st.rerun()
+
+            with col2:
+                if st.button("Modify Plan", key=f"modify_{plan['id']}"):
+                    loaded_plan = load_plan_from_supabase(plan["id"])
+
+                    if loaded_plan:
+                        st.session_state.plan = loaded_plan
+                        st.session_state.current_plan_id = plan["id"]
+                        st.session_state.plan_loaded_for_editing = True
+                        st.session_state.page = "goal_setup"
+                        st.rerun()
+
+            with col3:
+                confirm_delete = st.checkbox(
+                    "Confirm delete",
+                    key=f"confirm_delete_{plan['id']}"
+                )
+
+                if st.button("Delete", key=f"delete_{plan['id']}"):
+                    if not confirm_delete:
+                        st.warning("Please check 'Confirm delete' first.")
+                    else:
+                        deleted = delete_plan_from_supabase(plan["id"])
+
+                        if deleted:
+                            if st.session_state.current_plan_id == plan["id"]:
+                                st.session_state.current_plan_id = None
+                                st.session_state.plan = None
+
+                            st.success("Plan deleted.")
+                            st.rerun()
+
+            st.markdown("---")
+
+    show_feedback_link("bottom")
+
+#-------------------------------------------
+
+def set_start_page_after_login():
+    if st.session_state.user is None:
+        return
+
+    user_plans = get_user_plans(st.session_state.user.id)
+
+    if user_plans:
+        st.session_state.page = "my_plans"
+    else:
+        st.session_state.page = "goal_setup"
+
+#-------------------------------------------------
+
+def get_today_usage(user_id):
+    if supabase is None:
+        return {
+            "plan_generations": 0,
+            "plan_regenerations": 0
+        }
+
+    today = date.today().isoformat()
+
+    response = (
+        supabase.table("usage_limits")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("usage_date", today)
+        .execute()
+    )
+
+    if response.data:
+        return response.data[0]
+
+    insert_response = (
+        supabase.table("usage_limits")
+        .insert({
+            "user_id": user_id,
+            "usage_date": today,
+            "plan_generations": 0,
+            "plan_regenerations": 0
+        })
+        .execute()
+    )
+
+    return insert_response.data[0]
+
+#-------------------------------------------------
+
+def can_generate_plan(user_id):
+    usage = get_today_usage(user_id)
+    return usage.get("plan_generations", 0) < MAX_PLAN_GENERATIONS_PER_DAY
+
+#-------------------------------------------------
+
+def can_regenerate_plan(user_id):
+    usage = get_today_usage(user_id)
+    return usage.get("plan_regenerations", 0) < MAX_PLAN_REGENERATIONS_PER_DAY
+
+#-------------------------------------------------
+
+def increment_usage(user_id, usage_type):
+    if supabase is None:
+        return
+
+    usage = get_today_usage(user_id)
+    usage_id = usage["id"]
+
+    if usage_type == "plan_generation":
+        new_count = usage.get("plan_generations", 0) + 1
+
+        supabase.table("usage_limits").update({
+            "plan_generations": new_count,
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("id", usage_id).execute()
+
+    elif usage_type == "plan_regeneration":
+        new_count = usage.get("plan_regenerations", 0) + 1
+
+        supabase.table("usage_limits").update({
+            "plan_regenerations": new_count,
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("id", usage_id).execute()
 
 # -----------------------------
 # UI
@@ -694,44 +985,33 @@ if st.session_state.user:
 
 selected_page = st.sidebar.radio(
     "Go to",
-    ["Goal Setup", "Progress Tracker"],
-    index=0 if st.session_state.page == "goal_setup" else 1
+    ["My Plans", "Create New Plan", "Progress Tracker"],
+    index=0 if st.session_state.page == "my_plans"
+    else 1 if st.session_state.page == "goal_setup"
+    else 2
 )
 
-if selected_page == "Goal Setup":
+usage = get_today_usage(st.session_state.user.id)
+
+remaining_generations = MAX_PLAN_GENERATIONS_PER_DAY - usage.get("plan_generations", 0)
+remaining_regenerations = MAX_PLAN_REGENERATIONS_PER_DAY - usage.get("plan_regenerations", 0)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Today's Usage")
+st.sidebar.write(f"Plan generations left: {max(0, remaining_generations)}")
+st.sidebar.write(f"Regenerations left: {max(0, remaining_regenerations)}")
+
+if selected_page == "My Plans":
+    st.session_state.page = "my_plans"
+elif selected_page == "Create New Plan":
     st.session_state.page = "goal_setup"
 else:
     st.session_state.page = "daily_checkin"
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("My Saved Plans")
 
-user_plans = get_user_plans(st.session_state.user.id)
-
-if user_plans:
-    plan_options = {
-        f"{plan['goal_summary']} — {plan.get('overall_deadline', '')}": plan["id"]
-        for plan in user_plans
-    }
-
-    selected_plan_label = st.sidebar.selectbox(
-        "Choose a saved plan",
-        list(plan_options.keys())
-    )
-
-    if st.sidebar.button("Load Selected Plan"):
-        selected_plan_id = plan_options[selected_plan_label]
-
-        loaded_plan = load_plan_from_supabase(selected_plan_id)
-
-        if loaded_plan:
-            st.session_state.plan = loaded_plan
-            st.session_state.current_plan_id = selected_plan_id
-            st.session_state.page = "daily_checkin"
-            st.sidebar.success("Plan loaded.")
-            st.rerun()
-else:
-    st.sidebar.caption("No saved plans yet.")
+if st.session_state.page == "my_plans":
+    show_my_plans_page()
+    st.stop()
 
 if st.session_state.page == "daily_checkin":
     show_daily_checkin_page()
@@ -759,8 +1039,9 @@ st.header("1. What goal are you trying to achieve?")
 goal = st.text_area(
     "Enter your goal",
     value=st.session_state.goal,
-    placeholder="Example: I want to lose weight, build my business, study better, or save money."
-)
+    placeholder="Example: I want to lose weight, build my business, study better, or save money.",
+    max_chars= MAX_GOAL_CHARACTERS
+    )
 
 if st.button("Generate SMART Suggestions"):
     if not goal.strip():
@@ -832,24 +1113,31 @@ if st.session_state.smart_suggestions:
     st.header("3. Generate Manageable Steps")
 
     if st.button("Generate Accountability Plan"):
-        missing_fields = [
-            SMART_FIELDS[key]["label"]
-            for key, value in st.session_state.smart_inputs.items()
-            if not value.strip()
-        ]
+        user_id = st.session_state.user.id
 
-        if missing_fields:
-            st.warning(f"Please complete these SMART fields first: {', '.join(missing_fields)}")
+        if not can_generate_plan(user_id):
+            st.error(
+                f"You have reached today's limit of {MAX_PLAN_GENERATIONS_PER_DAY} plan generations. Please try again tomorrow."
+            )
         else:
-            with st.spinner("Generating your step-by-step accountability plan..."):
-                try:
-                    st.session_state.plan = generate_plan(
-                        st.session_state.goal,
-                        st.session_state.smart_inputs
-                    )
-                    st.success("Plan generated.")
-                except Exception as e:
-                    st.error(f"Could not generate plan: {e}")
+            missing_fields = [
+                SMART_FIELDS[key]["label"]
+                for key, value in st.session_state.smart_inputs.items()
+                if not value.strip()
+            ]
+
+            if missing_fields:
+                st.warning(f"Please complete these SMART fields first: {', '.join(missing_fields)}")
+            else:
+                with st.spinner("Generating your step-by-step accountability plan..."):
+                    try:
+                        st.session_state.plan = generate_plan(
+                            st.session_state.goal,
+                            st.session_state.smart_inputs
+                        )
+                        st.success("Plan generated.")
+                    except Exception as e:
+                        st.error(f"Could not generate plan: {e}")
 
 
 # -----------------------------
@@ -887,12 +1175,24 @@ if st.session_state.plan:
 
     st.session_state.plan["steps"] = edited_df.to_dict(orient="records")
 
-    st.download_button(
-        label="Download Plan as JSON",
-        data=json.dumps(st.session_state.plan, indent=2),
-        file_name="accountability_plan.json",
-        mime="application/json"
-    )
+    if st.session_state.current_plan_id:
+        if st.button("Save Changes to This Plan"):
+            updated = update_existing_plan_in_supabase(
+                st.session_state.current_plan_id,
+                st.session_state.plan
+            )
+
+            if updated:
+                st.success("Changes saved successfully.")
+    else:
+        st.info("This is a new plan. Click Save Plan to store it permanently.") 
+
+        st.download_button(
+            label="Download Plan as JSON",
+            data=json.dumps(st.session_state.plan, indent=2),
+            file_name="accountability_plan.json",
+            mime="application/json"
+        )
 
 
 # -----------------------------
@@ -919,11 +1219,18 @@ if st.session_state.plan:
         st.session_state.clarification_notes = st.text_area(
             "What is wrong with the plan? What obstacles, schedule issues, or missing details should I consider?",
             value=st.session_state.clarification_notes,
-            placeholder="Example: The steps are too hard, I only have 30 minutes per day, I work evening shifts, or the deadline is too tight."
+            placeholder="Example: The steps are too hard, I only have 30 minutes per day, I work evening shifts, or the deadline is too tight.",
+            max_chars=MAX_CLARIFICATION_CHARACTERS
         )
 
         if st.button("Regenerate Improved Plan"):
-            if not st.session_state.clarification_notes.strip():
+            user_id = st.session_state.user.id
+
+            if not can_regenerate_plan(user_id):
+                st.error(
+                    f"You have reached today's limit of {MAX_PLAN_REGENERATIONS_PER_DAY} plan regenerations. Please try again tomorrow."
+                )
+            elif not st.session_state.clarification_notes.strip():
                 st.warning("Please explain what needs to change first.")
             else:
                 with st.spinner("Regenerating the plan using your feedback and chat history..."):
@@ -933,6 +1240,7 @@ if st.session_state.plan:
                             st.session_state.smart_inputs,
                             st.session_state.clarification_notes
                         )
+                        increment_usage(user_id, "plan_regeneration")
                         st.success("Improved plan generated.")
                         st.rerun()
                     except Exception as e:
@@ -940,18 +1248,21 @@ if st.session_state.plan:
 
 st.subheader("Save Your Plan")
 
-if st.button("Save Plan"):
-    user_id = st.session_state.user.id
+if st.session_state.current_plan_id:
+    st.info("This plan is already saved. Use 'Save Changes to This Plan' after editing.")
+else:
+    if st.button("Save Plan"):
+        user_id = st.session_state.user.id
 
-    plan_id = save_plan_to_supabase(
-        st.session_state.plan,
-        user_id
-    )
+        plan_id = save_plan_to_supabase(
+            st.session_state.plan,
+            user_id
+        )
 
-    if plan_id:
-        st.session_state.current_plan_id = plan_id
-        st.success("Plan saved successfully.")
-        st.code(plan_id)
+        if plan_id:
+            st.session_state.current_plan_id = plan_id
+            st.success("Plan saved successfully.")
+            st.code(plan_id)
 
 
 # -----------------------------
