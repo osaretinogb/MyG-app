@@ -168,20 +168,116 @@ def init_session_state():
 # -----------------------------
 # OpenAI Helpers
 # -----------------------------
+
+def is_auth_session_error(error):
+    """
+    Returns True when an error appears to mean that the
+    user's Supabase authentication session is no longer valid.
+    """
+    message = str(error).lower()
+
+    auth_error_phrases = [
+        "invalid refresh token",
+        "refresh token already used",
+        "refresh_token_already_used",
+        "refresh_token_not_found",
+        "jwt expired",
+        "invalid jwt",
+        "session expired",
+        "not authenticated",
+        "authentication required",
+    ]
+
+    return any(
+        phrase in message
+        for phrase in auth_error_phrases
+    )
+
+
+def return_user_to_login(message):
+    """
+    Clears the invalid local login session and redirects
+    the user to the login page.
+    """
+
+    keys_to_clear = [
+        "user",
+        "session",
+        "supabase_client",
+        "current_plan_id",
+        "plan",
+        "user_plans",
+        "page",
+    ]
+
+    for key in keys_to_clear:
+        st.session_state.pop(key, None)
+
+    # Set this after clearing the other values so it survives the rerun.
+    st.session_state.auth_notice = message
+
+    st.rerun()
+
+#----------------------------------------------------------------------
+
+def handle_login():
+    email = st.session_state.get("login_email", "").strip().lower()
+    password = st.session_state.get("login_password", "")
+
+    if not email or not password:
+        st.session_state.login_error = (
+            "Please enter your email and password."
+        )
+        return
+
+    try:
+        response = supabase.auth.sign_in_with_password({
+            "email": email,
+            "password": password,
+        })
+
+        if response.user and response.session:
+            st.session_state.user = response.user
+            st.session_state.session = response.session
+            st.session_state.login_error = ""
+
+            set_start_page_after_login()
+        else:
+            st.session_state.login_error = (
+                "Login was unsuccessful. Check your email and password."
+            )
+
+    except Exception as error:
+        st.session_state.login_error = f"Login failed: {error}"
+
+#-----------------------------------------------------------------
 def show_login_page():
     st.title("🔐 MyG Accountability App")
     st.caption("Public Beta")
 
+    auth_notice = st.session_state.pop(
+        "auth_notice",
+        None
+    )
+
+    if auth_notice:
+        st.warning(auth_notice)
+
     st.warning(
-    "Public Beta: This app is still being improved. Please do not enter highly sensitive personal information. "
-    "Use it for goal planning and accountability testing.")
+        "Public Beta: This app is still being improved. "
+        "Please do not enter highly sensitive personal information. "
+        "Use it for goal planning and accountability testing."
+    )
 
     st.info(
         "Create an account or log in to save your goals, plans, and progress."
     )
 
     if supabase is None:
-        st.error("Supabase is not configured. Login cannot work until Supabase keys are added.")
+        st.error(
+            "Supabase is not configured. "
+            "Login cannot work until the Supabase keys are added."
+        )
         st.stop()
 
     auth_mode = st.radio(
@@ -191,88 +287,143 @@ def show_login_page():
         key="auth_mode_radio"
     )
 
-    email = st.text_input("Email")
-    password = st.text_input("Password", type="password")
+    # -----------------------------
+    # Login form
+    # -----------------------------
+    if auth_mode == "Login":
+        if "login_error" not in st.session_state:
+            st.session_state.login_error = ""
 
-    if auth_mode == "Sign Up":
-        confirm_password = st.text_input("Confirm Password", type="password")
+        with st.form(
+            "login_form",
+            clear_on_submit=False,
+            enter_to_submit=True
+        ):
+            st.text_input(
+                "Email",
+                key="login_email",
+                autocomplete="email"
+            )
 
-        if st.button("Create Account"):
-            if not email or not password or not confirm_password:
-                st.warning("Please enter your email, password, and confirmation password.")
-                return
+            st.text_input(
+                "Password",
+                type="password",
+                key="login_password",
+                autocomplete="current-password"
+            )
 
-            if password != confirm_password:
-                st.warning("Passwords do not match.")
-                return
+            st.form_submit_button(
+                "Login",
+                use_container_width=True,
+                type="primary",
+                on_click=handle_login
+            )
 
-            if len(password) < 6:
-                st.warning("Password should be at least 6 characters.")
-                return
+        if st.session_state.user is not None:
+            st.rerun()
 
-            try:
-                response = supabase.auth.sign_up({
-                    "email": email,
-                    "password": password,
-                })
+        if st.session_state.login_error:
+            st.error(st.session_state.login_error)
 
-                if response.user:
-                    st.success("Account created successfully.")
-
-                    if response.session:
-                        st.session_state.user = response.user
-                        st.session_state.session = response.session
-                        restore_supabase_session()
-                        set_start_page_after_login()
-                        st.rerun()
-                    else:
-                        st.info("Check your email to confirm your account before logging in.")
-
-                else:
-                    st.warning("Account creation did not complete. Please try again.")
-
-            except Exception as e:
-                st.error(f"Sign up failed: {e}")
-
+    # -----------------------------
+    # Sign-up form
+    # -----------------------------
     else:
-        if st.button("Login"):
-            if not email or not password:
-                st.warning("Please enter your email and password.")
-                return
+        with st.form(
+            "signup_form",
+            clear_on_submit=False,
+            enter_to_submit=True
+        ):
+            email = st.text_input(
+                "Email",
+                key="signup_email",
+                autocomplete="email"
+            )
 
-            try:
-                response = supabase.auth.sign_in_with_password({
-                    "email": email,
-                    "password": password,
-                })
+            password = st.text_input(
+                "Password",
+                type="password",
+                key="signup_password",
+                autocomplete="new-password"
+            )
 
-                if response.user and response.session:
-                    st.session_state.user = response.user
-                    st.session_state.session = response.session
-                    restore_supabase_session()
-                    set_start_page_after_login()
-                    st.success("Logged in successfully.")
-                    st.rerun()
-                else:
-                    st.warning("Login failed. Please check your email and password.")
+            confirm_password = st.text_input(
+                "Confirm Password",
+                type="password",
+                key="signup_confirm_password",
+                autocomplete="new-password"
+            )
 
-            except Exception as e:
-                st.error(f"Login failed: {e}")
+            signup_submitted = st.form_submit_button(
+                "Create Account",
+                use_container_width=True,
+                type="primary"
+            )
 
+        if signup_submitted:
+            email = email.strip().lower()
+
+            if not email or not password or not confirm_password:
+                st.warning(
+                    "Please enter your email, password, "
+                    "and confirmation password."
+                )
+
+            elif password != confirm_password:
+                st.warning("Passwords do not match.")
+
+            elif len(password) < 6:
+                st.warning(
+                    "Password must contain at least 6 characters."
+                )
+
+            else:
+                try:
+                    response = supabase.auth.sign_up({
+                        "email": email,
+                        "password": password,
+                    })
+
+                    if response.user:
+                        if response.session:
+                            st.session_state.user = response.user
+                            st.session_state.session = response.session
+
+                            set_start_page_after_login()
+                            st.rerun()
+
+                        else:
+                            st.success("Account created successfully.")
+                            st.info(
+                                "Check your email to confirm your account, "
+                                "then return here to log in."
+                            )
+
+                    else:
+                        st.error(
+                            "Account creation did not complete. "
+                            "Please try again."
+                        )
+
+                except Exception as error:
+                    st.error(f"Sign up failed: {error}")
+                    
 #----------------------------------------------------
 
 def logout_user():
+    supabase_client = st.session_state.get(
+        "supabase_client"
+    )
+
     try:
-        if supabase is not None:
-            supabase.auth.sign_out()
+        if supabase_client is not None:
+            supabase_client.auth.sign_out()
     except Exception:
         pass
 
-    st.session_state.user = None
-    st.session_state.session = None
-    st.session_state.page = "goal_setup"
-    st.session_state.plan = None
-    st.session_state.current_plan_id = None
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+
     st.rerun()
 
 #-----------------------------------------------------
@@ -560,15 +711,32 @@ def get_secret_value(key):
     except Exception:
         return os.getenv(key)
 
+#-----------------------------------------------------------
 
 supabase_url = get_secret_value("SUPABASE_URL")
 supabase_key = get_secret_value("SUPABASE_ANON_KEY")
 
 if not supabase_url or not supabase_key:
-    st.warning("Supabase is not configured yet. Plans will not be saved permanently.")
-    supabase = None
-else:
-    supabase = create_client(supabase_url, supabase_key)
+    st.error(
+        "Supabase is not configured. "
+        "Add SUPABASE_URL and SUPABASE_ANON_KEY."
+    )
+    st.stop()
+#----------------------------------------------------------
+
+def get_supabase_client():
+    """
+    Creates one Supabase client for the current
+    Streamlit user session and reuses it on reruns.
+    """
+
+    if "supabase_client" not in st.session_state:
+        st.session_state.supabase_client = create_client(
+            supabase_url,
+            supabase_key
+        )
+
+    return st.session_state.supabase_client
 
 #----------------------------------------------------------
 
@@ -620,51 +788,62 @@ def load_plan_from_supabase(plan_id):
     if supabase is None:
         st.error("Supabase is not configured.")
         return None
+    
+    try:
 
-    plan_response = (
-        supabase.table("plans")
-        .select("*")
-        .eq("id", plan_id)
-        .single()
-        .execute()
-    )
+        plan_response = (
+            supabase.table("plans")
+            .select("*")
+            .eq("id", plan_id)
+            .single()
+            .execute()
+        )
 
-    if not plan_response.data:
-        st.error("No plan found with that Plan ID.")
-        return None
+        if not plan_response.data:
+            st.error("No plan found with that Plan ID.")
+            return None
 
-    steps_response = (
-        supabase.table("plan_steps")
-        .select("*")
-        .eq("plan_id", plan_id)
-        .order("step_number")
-        .execute()
-    )
+        steps_response = (
+            supabase.table("plan_steps")
+            .select("*")
+            .eq("plan_id", plan_id)
+            .order("step_number")
+            .execute()
+        )
 
-    plan_data = plan_response.data
-    steps_data = steps_response.data or []
+        plan_data = plan_response.data
+        steps_data = steps_response.data or []
 
-    return {
-        "goal_summary": plan_data.get("goal_summary", ""),
-        "smart_goal": plan_data.get("smart_goal", {}),
-        "overall_deadline": plan_data.get("overall_deadline", ""),
-        "likely_obstacle": plan_data.get("likely_obstacle", ""),
-        "today_next_action": plan_data.get("today_next_action", ""),
-        "steps": [
-            {
-                "step_number": step.get("step_number"),
-                "step_name": step.get("step_name", ""),
-                "description": step.get("description", ""),
-                "time_block": step.get("time_block", ""),
-                "deadline": step.get("deadline", ""),
-                "accountability_check": step.get("accountability_check", ""),
-                "status": step.get("status", "Not Started"),
-                "notes": step.get("notes", "")
-            }
-            for step in steps_data
-        ]
-    }
+        return {
+            "goal_summary": plan_data.get("goal_summary", ""),
+            "smart_goal": plan_data.get("smart_goal", {}),
+            "overall_deadline": plan_data.get("overall_deadline", ""),
+            "likely_obstacle": plan_data.get("likely_obstacle", ""),
+            "today_next_action": plan_data.get("today_next_action", ""),
+            "steps": [
+                {
+                    "step_number": step.get("step_number"),
+                    "step_name": step.get("step_name", ""),
+                    "description": step.get("description", ""),
+                    "time_block": step.get("time_block", ""),
+                    "deadline": step.get("deadline", ""),
+                    "accountability_check": step.get("accountability_check", ""),
+                    "status": step.get("status", "Not Started"),
+                    "notes": step.get("notes", "")
+                }
+                for step in steps_data
+            ]
+        }
 
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. Please log in again. "
+                "Any changes that were successfully autosaved remain available."
+            )
+
+        st.session_state.autosave_error = str(error)
+        return False
 #-------------------------------------------------------
 
 def update_step_progress_in_supabase(plan_id, steps):
@@ -681,23 +860,6 @@ def update_step_progress_in_supabase(plan_id, steps):
         }).eq("plan_id", plan_id).eq("step_number", step_number).execute()
 
 
-#-----------------------------------------------
-
-def restore_supabase_session():
-    if supabase is None:
-        return
-
-    session = st.session_state.get("session")
-
-    if session:
-        try:
-            supabase.auth.set_session(
-                session.access_token,
-                session.refresh_token
-            )
-        except Exception as e:
-            st.warning(f"Could not restore Supabase session: {e}")
-
 #---------------------------------------------------
 
 def delete_plan_from_supabase(plan_id):
@@ -708,8 +870,14 @@ def delete_plan_from_supabase(plan_id):
     try:
         supabase.table("plans").delete().eq("id", plan_id).execute()
         return True
-    except Exception as e:
-        st.error(f"Could not delete plan: {e}")
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. Please log in again. "
+                "Please Log in again."
+            )
+
+        st.error(f"Could not delete your plans: {error}")
         return False
 
 #--------------------------------------------------
@@ -754,8 +922,14 @@ def update_existing_plan_in_supabase(plan_id, plan):
 
         return True
 
-    except Exception as e:
-        st.error(f"Could not update plan: {e}")
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. Please log in again. "
+                "Any changes that were successfully autosaved remain available."
+            )
+
+        st.error(f"Could not load your plans: {error}")
         return False
 
 #---------------------------------------------------
@@ -763,16 +937,27 @@ def update_existing_plan_in_supabase(plan_id, plan):
 def get_user_plans(user_id):
     if supabase is None:
         return []
+    try:
+        response = (
+            supabase.table("plans")
+            .select("id, created_at, goal_summary, overall_deadline, likely_obstacle, today_next_action")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
 
-    response = (
-        supabase.table("plans")
-        .select("id, created_at, goal_summary, overall_deadline, likely_obstacle, today_next_action")
-        .eq("user_id", user_id)
-        .order("created_at", desc=True)
-        .execute()
-    )
+        return response.data or []
+    
+    
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. "
+                "Please log in again to access your plans."
+            )
 
-    return response.data or []
+        st.error(f"Could not load your plans: {error}")
+        return []
 
 #------------------------------------------
 
@@ -907,30 +1092,41 @@ def get_today_usage(user_id):
         }
 
     today = date.today().isoformat()
+    try:
+        response = (
+            supabase.table("usage_limits")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("usage_date", today)
+            .execute()
+        )
 
-    response = (
-        supabase.table("usage_limits")
-        .select("*")
-        .eq("user_id", user_id)
-        .eq("usage_date", today)
-        .execute()
-    )
+        if response.data:
+            return response.data[0]
 
-    if response.data:
-        return response.data[0]
+        insert_response = (
+            supabase.table("usage_limits")
+            .insert({
+                "user_id": user_id,
+                "usage_date": today,
+                "plan_generations": 0,
+                "plan_regenerations": 0
+            })
+            .execute()
+        )
 
-    insert_response = (
-        supabase.table("usage_limits")
-        .insert({
-            "user_id": user_id,
-            "usage_date": today,
-            "plan_generations": 0,
-            "plan_regenerations": 0
-        })
-        .execute()
-    )
+        return insert_response.data[0]
+    
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. "
+                "Please log in again to access your plans."
+            )
 
-    return insert_response.data[0]
+        st.error(f"Could not load your plans: {error}")
+        return []
+
 
 #-------------------------------------------------
 
@@ -973,7 +1169,8 @@ def increment_usage(user_id, usage_type):
 # UI
 # -----------------------------
 init_session_state()
-restore_supabase_session()
+
+supabase = get_supabase_client()
 
 if st.session_state.user is None:
     show_login_page()
