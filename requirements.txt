@@ -3,3 +3,5 @@ openai
 python-dotenv
 pandas
 supabase
+extra-streamlit-components
+cryptography

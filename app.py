@@ -1,19 +1,44 @@
-from supabase import create_client
-import os
-import json
-import re
-from datetime import datetime, date
-from typing import Dict, List, Any
+"""MyG Accountability App.
 
+This Streamlit application helps a signed-in user turn a broad goal into a
+SMART goal, generate an action plan with OpenAI, save the plan in Supabase,
+and track progress over time.
+
+The file is divided into clearly labelled sections so it is easier to learn
+what each block does and where future changes should be made.
+"""
+
+# Python standard-library imports.
+import base64
+import hashlib
+import json
+import os
+import re
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List
+from urllib.parse import unquote
+
+# Third-party package imports.
+import extra_streamlit_components as stx
 import pandas as pd
 import streamlit as st
+from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from openai import OpenAI
+from supabase import create_client
+
+
+# Streamlit requires page configuration before the app creates visible UI.
+st.set_page_config(
+    page_title="Accountability Goal Tracker",
+    page_icon="✅",
+    layout="wide",
+)
 
 
 
 # -----------------------------
-# Setup
+# Environment, secrets, and OpenAI setup
 # -----------------------------
 load_dotenv()
 
@@ -110,11 +135,15 @@ SMART_FIELDS = {
     },
 }
 
-
 # -----------------------------
-# Session State
+# Session State defaults
 # -----------------------------
 def init_session_state():
+    """Create every Session State value used by the application.
+
+    Streamlit reruns this file after most user interactions. These checks keep
+    existing values instead of resetting them during an ordinary rerun.
+    """
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
@@ -142,6 +171,7 @@ def init_session_state():
     if "clarification_notes" not in st.session_state:
         st.session_state.clarification_notes = ""
 
+    # Default page used when the URL contains no valid `view` parameter.
     if "page" not in st.session_state:
         st.session_state.page = "my_plans"
 
@@ -151,6 +181,8 @@ def init_session_state():
     if "plan_loaded_for_editing" not in st.session_state:
         st.session_state.plan_loaded_for_editing = False
 
+    # Authentication objects exist only for the current Streamlit session.
+    # A browser refresh rebuilds them from the encrypted authentication cookie.
     if "user" not in st.session_state:
         st.session_state.user = None
 
@@ -166,9 +198,10 @@ def init_session_state():
 
 
 # -----------------------------
-# OpenAI Helpers
+# Authentication and OpenAI helper functions
 # -----------------------------
 
+# Detect whether a Supabase exception represents an invalid login session.
 def is_auth_session_error(error):
     """
     Returns True when an error appears to mean that the
@@ -194,6 +227,7 @@ def is_auth_session_error(error):
     )
 
 
+# Clear broken authentication state and safely return the user to login.
 def return_user_to_login(message):
     """
     Clears the invalid local login session and redirects
@@ -220,6 +254,7 @@ def return_user_to_login(message):
 
 #----------------------------------------------------------------------
 
+# Authenticate the email/password form and store the resulting Supabase session.
 def handle_login():
     email = st.session_state.get("login_email", "").strip().lower()
     password = st.session_state.get("login_password", "")
@@ -241,6 +276,10 @@ def handle_login():
             st.session_state.session = response.session
             st.session_state.login_error = ""
 
+            st.session_state.pop("logout_in_progress", None)
+
+            save_auth_cookie(response.session)
+
             set_start_page_after_login()
         else:
             st.session_state.login_error = (
@@ -251,6 +290,7 @@ def handle_login():
         st.session_state.login_error = f"Login failed: {error}"
 
 #-----------------------------------------------------------------
+# Render the login and account-creation forms.
 def show_login_page():
     st.title("🔐 MyG Accountability App")
     st.caption("Public Beta")
@@ -389,6 +429,9 @@ def show_login_page():
                             st.session_state.user = response.user
                             st.session_state.session = response.session
 
+                            st.session_state.pop("logout_in_progress", None)
+
+                            save_auth_cookie(response.session)
                             set_start_page_after_login()
                             st.rerun()
 
@@ -411,23 +454,57 @@ def show_login_page():
 #----------------------------------------------------
 
 def logout_user():
-    supabase_client = st.session_state.get(
-        "supabase_client"
-    )
+    """
+    Sign out from Supabase and prepare the browser cookie
+    for deletion without accidentally restoring it again.
+    """
+
+    # Tell the next Streamlit rerun that this logout was intentional.
+    st.session_state.logout_in_progress = True
+
+    current_client = st.session_state.get("supabase_client")
 
     try:
-        if supabase_client is not None:
-            supabase_client.auth.sign_out()
-    except Exception:
-        pass
+        if current_client is not None:
+            current_client.auth.sign_out()
+    except Exception as error:
+        # Even if remote sign-out fails, clear the local login.
+        print(
+            "LOGOUT WARNING:",
+            type(error).__name__,
+            str(error),
+        )
 
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
+    # Clear local authentication before the cookie component runs.
+    keys_to_clear = [
+        "user",
+        "session",
+        "supabase_client",
+        "current_plan_id",
+        "plan",
+        "user_plans",
+        "page",
+        "auth_cookie_session_fingerprint",
+        "pending_auth_cookie_session",
+    ]
+
+    for key in keys_to_clear:
+        st.session_state.pop(key, None)
+
+    # Delete the cookie during the next startup run.
+    # This avoids a race with the browser cookie component.
+    st.session_state.pending_auth_cookie_delete = True
+
+    st.query_params.clear()
+
+    st.session_state.auth_notice = (
+        "You have been logged out."
+    )
 
     st.rerun()
-
 #-----------------------------------------------------
 
+# Send the accumulated conversation to the OpenAI Responses API.
 def call_model(user_prompt: str) -> str:
     """
     Sends full conversation history plus the newest user prompt.
@@ -456,6 +533,7 @@ def call_model(user_prompt: str) -> str:
 
 #------------------------------------------------------------
 
+# Convert the model response into a Python dictionary.
 def extract_json(text: str) -> Dict[str, Any]:
     """
     Attempts to safely extract JSON from the model response.
@@ -477,6 +555,7 @@ def extract_json(text: str) -> Dict[str, Any]:
 # -----------------------------
 # Goal Suggestion Logic
 # -----------------------------
+# Ask the model for suggested values for each SMART field.
 def generate_smart_suggestions(goal: str) -> Dict[str, str]:
     prompt = f"""
 The user gave this goal:
@@ -500,6 +579,7 @@ Return valid JSON only in this exact format:
     return extract_json(response_text)
 
 
+# Ask the model to turn the completed SMART goal into actionable steps.
 def generate_plan(goal: str, smart_inputs: Dict[str, str], clarification_notes: str = "") -> Dict[str, Any]:
     prompt = f"""
 Create a full accountability plan from this goal and SMART information.
@@ -560,12 +640,14 @@ Return JSON in this exact structure:
 
 #-----------------------------------------------
 
+# Convert plan steps into a DataFrame for Streamlit's editable table.
 def plan_to_dataframe(plan: Dict[str, Any]) -> pd.DataFrame:
     steps = plan.get("steps", [])
     return pd.DataFrame(steps)
 
 #---------------------------------------------------------
 
+# Display the Google Form feedback link at the top or bottom of a page.
 def show_feedback_link(position="top"):
     if position == "top":
         st.markdown(
@@ -594,6 +676,7 @@ def show_feedback_link(position="top"):
 
 #---------------------------------------------------------
     
+# Render the Progress Tracker and allow users to update step progress.
 def show_daily_checkin_page():
 
     show_feedback_link("top")
@@ -605,7 +688,7 @@ def show_daily_checkin_page():
         st.warning("No plan found yet. Please create a goal plan first.")
 
         if st.button("Go back to goal setup"):
-            st.session_state.page = "goal_setup"
+            set_current_page("goal_setup")
             st.rerun()
 
         return
@@ -691,7 +774,7 @@ def show_daily_checkin_page():
 
     with col2:
         if st.button("Back to Plan"):
-            st.session_state.page = "goal_setup"
+            set_current_page("goal_setup")
             st.rerun()
 
     st.download_button(
@@ -705,6 +788,7 @@ def show_daily_checkin_page():
 
 #-----------------------------------------------------------
 
+# Read a secret from Streamlit Cloud first, then fall back to the local .env file.
 def get_secret_value(key):
     try:
         return st.secrets[key]
@@ -724,6 +808,7 @@ if not supabase_url or not supabase_key:
     st.stop()
 #----------------------------------------------------------
 
+# Create one Supabase client per Streamlit session and reuse it on reruns.
 def get_supabase_client():
     """
     Creates one Supabase client for the current
@@ -740,50 +825,63 @@ def get_supabase_client():
 
 #----------------------------------------------------------
 
+# Insert a plan and all of its steps into Supabase.
 def save_plan_to_supabase(plan, user_id):
-    if supabase is None:
-        st.error("Supabase is not configured, so the plan could not be saved.")
+    try:
+        if supabase is None:
+            st.error("Supabase is not configured, so the plan could not be saved.")
+            return None
+
+        plan_payload = {
+            "user_id": user_id,
+            "goal_summary": plan.get("goal_summary", ""),
+            "smart_goal": plan.get("smart_goal", {}),
+            "overall_deadline": plan.get("overall_deadline", ""),
+            "likely_obstacle": plan.get("likely_obstacle", ""),
+            "today_next_action": plan.get("today_next_action", "")
+        }
+
+        plan_response = supabase.table("plans").insert(plan_payload).execute()
+
+        if not plan_response.data:
+            st.error("Plan could not be saved.")
+            return None
+
+        plan_id = plan_response.data[0]["id"]
+
+        step_rows = []
+
+        for step in plan.get("steps", []):
+            step_rows.append({
+                "plan_id": plan_id,
+                "step_number": step.get("step_number"),
+                "step_name": step.get("step_name", ""),
+                "description": step.get("description", ""),
+                "time_block": step.get("time_block", ""),
+                "deadline": step.get("deadline", ""),
+                "accountability_check": step.get("accountability_check", ""),
+                "status": step.get("status", "Not Started"),
+                "notes": step.get("notes", "")
+            })
+
+        if step_rows:
+            supabase.table("plan_steps").insert(step_rows).execute()
+
+        return plan_id
+
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. Please log in again. "
+                "Any changes that were successfully autosaved remain available."
+            )
+
+        st.error(f"Could not save your plan: {error}")
         return None
-
-    plan_payload = {
-        "user_id": user_id,
-        "goal_summary": plan.get("goal_summary", ""),
-        "smart_goal": plan.get("smart_goal", {}),
-        "overall_deadline": plan.get("overall_deadline", ""),
-        "likely_obstacle": plan.get("likely_obstacle", ""),
-        "today_next_action": plan.get("today_next_action", "")
-    }
-
-    plan_response = supabase.table("plans").insert(plan_payload).execute()
-
-    if not plan_response.data:
-        st.error("Plan could not be saved.")
-        return None
-
-    plan_id = plan_response.data[0]["id"]
-
-    step_rows = []
-
-    for step in plan.get("steps", []):
-        step_rows.append({
-            "plan_id": plan_id,
-            "step_number": step.get("step_number"),
-            "step_name": step.get("step_name", ""),
-            "description": step.get("description", ""),
-            "time_block": step.get("time_block", ""),
-            "deadline": step.get("deadline", ""),
-            "accountability_check": step.get("accountability_check", ""),
-            "status": step.get("status", "Not Started"),
-            "notes": step.get("notes", "")
-        })
-
-    if step_rows:
-        supabase.table("plan_steps").insert(step_rows).execute()
-
-    return plan_id
 
 #-------------------------------------------------------
 
+# Retrieve one saved plan and rebuild the app's plan dictionary.
 def load_plan_from_supabase(plan_id):
     if supabase is None:
         st.error("Supabase is not configured.")
@@ -846,6 +944,7 @@ def load_plan_from_supabase(plan_id):
         return False
 #-------------------------------------------------------
 
+# Save status and notes for every step in the Progress Tracker.
 def update_step_progress_in_supabase(plan_id, steps):
     if supabase is None:
         st.warning("Supabase is not configured. Progress was saved only for this session.")
@@ -862,6 +961,7 @@ def update_step_progress_in_supabase(plan_id, steps):
 
 #---------------------------------------------------
 
+# Delete a plan; the database cascade should remove its steps.
 def delete_plan_from_supabase(plan_id):
     if supabase is None:
         st.error("Supabase is not configured.")
@@ -882,6 +982,7 @@ def delete_plan_from_supabase(plan_id):
 
 #--------------------------------------------------
 
+# Update a plan and replace its saved step rows.
 def update_existing_plan_in_supabase(plan_id, plan):
     if supabase is None:
         st.error("Supabase is not configured.")
@@ -933,7 +1034,313 @@ def update_existing_plan_in_supabase(plan_id, plan):
         return False
 
 #---------------------------------------------------
+# Persistent authentication: encrypted browser-cookie management
+#------------------------------------------------
+AUTH_COOKIE_NAME = "myg_auth_session"
 
+cookie_secret = get_secret_value("COOKIE_SECRET")
+
+if not cookie_secret:
+    st.error(
+        "COOKIE_SECRET is missing. Add it to your local .env file "
+        "and Streamlit Cloud secrets."
+    )
+    st.stop()
+
+
+# Derive a Fernet encryption key from COOKIE_SECRET.
+def create_cookie_cipher():
+    """
+    Converts COOKIE_SECRET into a valid Fernet encryption key.
+    """
+    secret_hash = hashlib.sha256(
+        cookie_secret.encode("utf-8")
+    ).digest()
+
+    fernet_key = base64.urlsafe_b64encode(secret_hash)
+
+    return Fernet(fernet_key)
+
+
+cookie_cipher = create_cookie_cipher()
+
+
+# The cookie manager is initialized later, after login restoration.
+# Creating this browser component before restoration can trigger an extra
+# Streamlit rerun and interrupt Supabase before the user is restored.
+cookie_manager = None
+
+#------------------------------------------------
+# Add cookie helper functions to manage the authentication session data.
+#------------------------------------------------
+
+# Use HTTPS-only cookies in production but allow HTTP on localhost.
+def should_use_secure_cookie():
+    """
+    Returns False for local Mac development and True
+    for the deployed HTTPS application.
+    """
+    try:
+        host = (
+            st.context.headers
+            .get("host", "")
+            .split(":")[0]
+            .lower()
+        )
+
+        if not host:
+            return False
+
+        local_hosts = {
+            "localhost",
+            "127.0.0.1",
+            "0.0.0.0",
+            "::1",
+        }
+
+        return host not in local_hosts
+
+    except Exception:
+        return False
+
+def save_auth_cookie(session):
+    """Encrypt and save the newest Supabase token pair in a browser cookie.
+
+    Supabase can rotate refresh tokens. The fingerprint prevents unnecessary
+    cookie writes while still allowing a newly rotated token pair to replace
+    the old cookie.
+    """
+    if not session:
+        return
+
+    access_token = getattr(session, "access_token", "")
+    refresh_token = getattr(session, "refresh_token", "")
+
+    if not access_token or not refresh_token:
+        return
+
+    session_fingerprint = hashlib.sha256(
+        f"{access_token}:{refresh_token}".encode("utf-8")
+    ).hexdigest()
+
+    if (
+        st.session_state.get("auth_cookie_session_fingerprint")
+        == session_fingerprint
+    ):
+        return
+
+    session_payload = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+    }
+
+    encrypted_value = cookie_cipher.encrypt(
+        json.dumps(session_payload).encode("utf-8")
+    ).decode("utf-8")
+
+    # A changing component key lets Streamlit execute another cookie update
+    # when Supabase supplies a different token pair.
+    component_key = session_fingerprint[:12]
+
+    if cookie_manager is None:
+        raise RuntimeError("Cookie manager has not been initialized.")
+
+    # Record the fingerprint before calling the browser component. The
+    # component can request a Streamlit rerun, so this prevents a write loop.
+    st.session_state.auth_cookie_session_fingerprint = session_fingerprint
+
+    cookie_manager.set(
+        AUTH_COOKIE_NAME,
+        encrypted_value,
+        key=f"set_auth_cookie_{component_key}",
+        path="/",
+        expires_at=datetime.now() + timedelta(days=30),
+        secure=should_use_secure_cookie(),
+        same_site="strict",
+    )
+
+
+def delete_auth_cookie():
+    """Expire the persistent authentication cookie in the browser."""
+    if cookie_manager is None:
+        # Restoration runs before the browser cookie component is created.
+        # Defer deletion until startup initializes the component.
+        st.session_state.pending_auth_cookie_delete = True
+        return
+
+    st.session_state.pop("auth_cookie_session_fingerprint", None)
+
+    cookie_manager.set(
+        AUTH_COOKIE_NAME,
+        "",
+        key="clear_myg_auth_cookie",
+        path="/",
+        expires_at=datetime.now() - timedelta(days=1),
+        secure=should_use_secure_cookie(),
+        same_site="strict",
+    )
+
+#------------------------------------------------
+# Login restoration function
+#------------------------------------------------
+
+def restore_login_from_cookie():
+    """Rebuild the Supabase login after a full browser refresh.
+
+    The function reads the encrypted token pair from the request cookie,
+    restores it into the new Supabase client, verifies the user, and saves any
+    rotated tokens back to the cookie.
+    """
+    if st.session_state.get("user") is not None:
+        return True
+
+    raw_cookie = st.context.cookies.get(AUTH_COOKIE_NAME)
+
+    if not raw_cookie:
+        return False
+
+    # Some browsers/components may quote or URL-encode a cookie value.
+    encrypted_cookie = unquote(str(raw_cookie)).strip()
+    if (
+        len(encrypted_cookie) >= 2
+        and encrypted_cookie[0] == encrypted_cookie[-1]
+        and encrypted_cookie[0] in {'"', "'"}
+    ):
+        encrypted_cookie = encrypted_cookie[1:-1]
+
+    try:
+        decrypted_value = cookie_cipher.decrypt(
+            encrypted_cookie.encode("utf-8")
+        ).decode("utf-8")
+
+        saved_tokens = json.loads(decrypted_value)
+        access_token = saved_tokens.get("access_token")
+        refresh_token = saved_tokens.get("refresh_token")
+
+        if not access_token or not refresh_token:
+            raise ValueError("Saved login tokens are incomplete.")
+
+        # Mark the token pair already stored in the browser. This prevents the
+        # later synchronization step from rewriting an unchanged cookie.
+        saved_session_fingerprint = hashlib.sha256(
+            f"{access_token}:{refresh_token}".encode("utf-8")
+        ).hexdigest()
+        st.session_state.auth_cookie_session_fingerprint = (
+            saved_session_fingerprint
+        )
+
+        # set_session restores a valid session and refreshes it when needed.
+        response = supabase.auth.set_session(access_token, refresh_token)
+        restored_session = getattr(response, "session", None)
+        restored_user = getattr(response, "user", None)
+
+        if restored_session is None:
+            raise ValueError("Supabase returned no restored session.")
+
+        # Some client versions may not populate response.user consistently.
+        # Verify the access token directly before trusting the restored login.
+        if restored_user is None:
+            user_response = supabase.auth.get_user(
+                restored_session.access_token
+            )
+            restored_user = getattr(user_response, "user", None)
+
+        if restored_user is None:
+            raise ValueError("Supabase returned no restored user.")
+
+        st.session_state.user = restored_user
+        st.session_state.session = restored_session
+        st.session_state.login_error = ""
+
+        # If Supabase rotated either token, postpone the cookie write until
+        # after the browser cookie component is initialized. Authentication is
+        # already restored, so a component-triggered rerun cannot log us out.
+        tokens_changed = (
+            restored_session.access_token != access_token
+            or restored_session.refresh_token != refresh_token
+        )
+
+        if tokens_changed:
+            st.session_state.pending_auth_cookie_session = restored_session
+
+        return True
+
+    except (InvalidToken, json.JSONDecodeError, ValueError) as error:
+        # These errors indicate a malformed, stale, or unreadable local cookie.
+        print(
+            "AUTH RESTORE ERROR:",
+            type(error).__name__,
+            str(error),
+        )
+        delete_auth_cookie()
+        st.session_state.auth_notice = (
+            "Your saved login was no longer valid. Please log in again."
+        )
+        return False
+
+    except Exception as error:
+        # Do not print the cookie or either token. Only print the error type and
+        # message so authentication can be diagnosed without exposing secrets.
+        print(
+            "AUTH RESTORE ERROR:",
+            type(error).__name__,
+            str(error),
+        )
+
+        if is_auth_session_error(error):
+            delete_auth_cookie()
+            st.session_state.auth_notice = (
+                "Your login session expired. Please log in again."
+            )
+        else:
+            # Keep the cookie for an unexpected temporary/network error.
+            st.session_state.auth_notice = (
+                "Your login could not be restored. Please try again."
+            )
+
+        return False
+
+
+def sync_auth_cookie_from_supabase():
+    """Keep the browser cookie synchronized with Supabase's current session.
+
+    Supabase refresh tokens are rotated. Calling get_session during an ordinary
+    app rerun lets Supabase refresh an expired access token, and save_auth_cookie
+    stores the newest token pair before a later browser refresh occurs.
+    """
+    if st.session_state.get("user") is None:
+        return False
+
+    try:
+        current_session = supabase.auth.get_session()
+
+        if current_session is None:
+            return_user_to_login(
+                "Your login session expired. Please log in again."
+            )
+
+        st.session_state.session = current_session
+        save_auth_cookie(current_session)
+        return True
+
+    except Exception as error:
+        if is_auth_session_error(error):
+            delete_auth_cookie()
+            return_user_to_login(
+                "Your login session expired. Please log in again."
+            )
+
+        # A temporary network problem should not automatically sign the user
+        # out. Database operations can show their own error when attempted.
+        print(
+            "AUTH COOKIE SYNC ERROR:",
+            type(error).__name__,
+            str(error),
+        )
+        return False
+    
+#-------------------------------------------------
+# Retrieve the signed-in user's saved plans for the My Plans page.
 def get_user_plans(user_id):
     if supabase is None:
         return []
@@ -961,6 +1368,7 @@ def get_user_plans(user_id):
 
 #------------------------------------------
 
+# Render saved plans and actions to open, modify, or delete them.
 def show_my_plans_page():
     show_feedback_link("top")
 
@@ -974,9 +1382,9 @@ def show_my_plans_page():
         st.info("You do not have any saved plans yet. Create your first plan to get started.")
 
         if st.button("Create My First Plan"):
-            st.session_state.page = "goal_setup"
+            set_current_page("goal_setup")
             st.session_state.plan = None
-            st.session_state.current_plan_id = None
+            set_current_plan_id(None)
             st.session_state.smart_suggestions = {}
             st.session_state.smart_inputs = {
                 "specific": "",
@@ -994,9 +1402,9 @@ def show_my_plans_page():
 
     with col_new:
         if st.button("➕ Create New Plan"):
-            st.session_state.page = "goal_setup"
+            set_current_page("goal_setup")
             st.session_state.plan = None
-            st.session_state.current_plan_id = None
+            set_current_plan_id(None)
             st.session_state.goal = ""
             st.session_state.smart_suggestions = {}
             st.session_state.smart_inputs = {
@@ -1030,8 +1438,8 @@ def show_my_plans_page():
 
                     if loaded_plan:
                         st.session_state.plan = loaded_plan
-                        st.session_state.current_plan_id = plan["id"]
-                        st.session_state.page = "daily_checkin"
+                        set_current_plan_id(plan["id"])
+                        set_current_page("daily_checkin")
                         st.rerun()
 
             with col2:
@@ -1040,9 +1448,9 @@ def show_my_plans_page():
 
                     if loaded_plan:
                         st.session_state.plan = loaded_plan
-                        st.session_state.current_plan_id = plan["id"]
+                        set_current_plan_id(plan["id"])
                         st.session_state.plan_loaded_for_editing = True
-                        st.session_state.page = "goal_setup"
+                        set_current_page("goal_setup")
                         st.rerun()
 
             with col3:
@@ -1059,7 +1467,7 @@ def show_my_plans_page():
 
                         if deleted:
                             if st.session_state.current_plan_id == plan["id"]:
-                                st.session_state.current_plan_id = None
+                                set_current_plan_id(None)
                                 st.session_state.plan = None
 
                             st.success("Plan deleted.")
@@ -1071,6 +1479,7 @@ def show_my_plans_page():
 
 #-------------------------------------------
 
+# Send new users to Goal Setup and returning users to My Plans.
 def set_start_page_after_login():
     if st.session_state.user is None:
         return
@@ -1078,12 +1487,13 @@ def set_start_page_after_login():
     user_plans = get_user_plans(st.session_state.user.id)
 
     if user_plans:
-        st.session_state.page = "my_plans"
+        set_current_page("my_plans")
     else:
-        st.session_state.page = "goal_setup"
+        set_current_page("goal_setup")
 
 #-------------------------------------------------
 
+# Read or create today's API-usage counter row.
 def get_today_usage(user_id):
     if supabase is None:
         return {
@@ -1124,24 +1534,30 @@ def get_today_usage(user_id):
                 "Please log in again to access your plans."
             )
 
-        st.error(f"Could not load your plans: {error}")
-        return []
+        st.error(f"Could not load today's usage: {error}")
+        return {
+            "plan_generations": 0,
+            "plan_regenerations": 0,
+        }
 
 
 #-------------------------------------------------
 
+# Check whether the user has remaining initial plan generations today.
 def can_generate_plan(user_id):
     usage = get_today_usage(user_id)
     return usage.get("plan_generations", 0) < MAX_PLAN_GENERATIONS_PER_DAY
 
 #-------------------------------------------------
 
+# Check whether the user has remaining plan regenerations today.
 def can_regenerate_plan(user_id):
     usage = get_today_usage(user_id)
     return usage.get("plan_regenerations", 0) < MAX_PLAN_REGENERATIONS_PER_DAY
 
 #-------------------------------------------------
 
+# Increase the appropriate daily usage counter after a successful API call.
 def increment_usage(user_id, usage_type):
     if supabase is None:
         return
@@ -1165,51 +1581,170 @@ def increment_usage(user_id, usage_type):
             "updated_at": datetime.utcnow().isoformat()
         }).eq("id", usage_id).execute()
 
-# -----------------------------
-# UI
-# -----------------------------
-init_session_state()
+VALID_PAGES = {
+    "my_plans",
+    "goal_setup",
+    "daily_checkin",
+}
 
+
+def set_current_page(page_name):
+    """Update the app's page in Session State and in the browser URL."""
+    if page_name not in VALID_PAGES:
+        page_name = "my_plans"
+
+    st.session_state.page = page_name
+    st.query_params["view"] = page_name
+
+
+def set_current_plan_id(plan_id):
+    """Remember which plan is open so it can be reloaded after a refresh."""
+    st.session_state.current_plan_id = plan_id
+
+    if plan_id:
+        st.query_params["plan_id"] = str(plan_id)
+    elif "plan_id" in st.query_params:
+        del st.query_params["plan_id"]
+
+# -----------------------------
+# Main application startup and page routing
+# -----------------------------
+
+# -----------------------------
+# Initialize app state and services
+# -----------------------------
+# Session State handles ordinary Streamlit reruns. The encrypted cookie below
+# rebuilds authentication after a complete browser refresh.
+init_session_state()
 supabase = get_supabase_client()
+
+# Restore Supabase before creating the third-party cookie component. The
+# component can trigger an extra Streamlit rerun when the page first loads.
+if (
+    st.session_state.user is None
+    and not st.session_state.get("logout_in_progress", False)
+):
+    restore_login_from_cookie()
+
+# The cookie manager is needed for login, logout, and token updates. At this
+# point any rerun it triggers is safe because restoration has already finished.
+cookie_manager = stx.CookieManager(
+    key="myg_cookie_manager"
+)
+
+# Complete any cookie operation that restoration had to postpone.
+if st.session_state.pop("pending_auth_cookie_delete", False):
+    delete_auth_cookie()
+
+pending_cookie_session = st.session_state.pop(
+    "pending_auth_cookie_session",
+    None,
+)
+if pending_cookie_session is not None:
+    save_auth_cookie(pending_cookie_session)
 
 if st.session_state.user is None:
     show_login_page()
     st.stop()
 
+# Keep the browser cookie updated if Supabase rotates tokens later.
+sync_auth_cookie_from_supabase()
+
+
+# -----------------------------
+# Restore navigation from URL query parameters
+# -----------------------------
+requested_page = st.query_params.get("view")
+requested_plan_id = st.query_params.get("plan_id")
+
+if requested_page in VALID_PAGES:
+    st.session_state.page = requested_page
+
+# A full refresh clears st.session_state.plan. When the URL identifies a saved
+# plan, load it again so Progress Tracker behaves like a normal page refresh.
+if requested_plan_id:
+    st.session_state.current_plan_id = requested_plan_id
+
+    if (
+        requested_page == "daily_checkin"
+        and st.session_state.plan is None
+    ):
+        refreshed_plan = load_plan_from_supabase(requested_plan_id)
+
+        if refreshed_plan:
+            st.session_state.plan = refreshed_plan
+        else:
+            set_current_plan_id(None)
+            set_current_page("my_plans")
+
+
+# -----------------------------
+# Sidebar
+# -----------------------------
 st.sidebar.title("Navigation")
 
-if st.session_state.user:
-    st.sidebar.success(f"Logged in as: {st.session_state.user.email}")
+st.sidebar.success(
+    f"Logged in as: {st.session_state.user.email}"
+)
 
-    if st.sidebar.button("Logout"):
-        logout_user()
+if st.sidebar.button("Logout"):
+    logout_user()
+
 
 selected_page = st.sidebar.radio(
     "Go to",
     ["My Plans", "Create New Plan", "Progress Tracker"],
-    index=0 if st.session_state.page == "my_plans"
-    else 1 if st.session_state.page == "goal_setup"
-    else 2
+    index=(
+        0 if st.session_state.page == "my_plans"
+        else 1 if st.session_state.page == "goal_setup"
+        else 2
+    )
 )
 
+
+# Update both session state and the URL.
+if selected_page == "My Plans":
+    set_current_page("my_plans")
+
+elif selected_page == "Create New Plan":
+    set_current_page("goal_setup")
+
+else:
+    set_current_page("daily_checkin")
+
+
+# -----------------------------
+# Daily usage
+# -----------------------------
 usage = get_today_usage(st.session_state.user.id)
 
-remaining_generations = MAX_PLAN_GENERATIONS_PER_DAY - usage.get("plan_generations", 0)
-remaining_regenerations = MAX_PLAN_REGENERATIONS_PER_DAY - usage.get("plan_regenerations", 0)
+remaining_generations = (
+    MAX_PLAN_GENERATIONS_PER_DAY
+    - usage.get("plan_generations", 0)
+)
+
+remaining_regenerations = (
+    MAX_PLAN_REGENERATIONS_PER_DAY
+    - usage.get("plan_regenerations", 0)
+)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Today's Usage")
-st.sidebar.write(f"Plan generations left: {max(0, remaining_generations)}")
-st.sidebar.write(f"Regenerations left: {max(0, remaining_regenerations)}")
 
-if selected_page == "My Plans":
-    st.session_state.page = "my_plans"
-elif selected_page == "Create New Plan":
-    st.session_state.page = "goal_setup"
-else:
-    st.session_state.page = "daily_checkin"
+st.sidebar.write(
+    f"Plan generations left: "
+    f"{max(0, remaining_generations)}"
+)
+
+st.sidebar.write(
+    f"Regenerations left: "
+    f"{max(0, remaining_regenerations)}"
+)
 
 
+# -----------------------------
+# Page routing
+# -----------------------------
 if st.session_state.page == "my_plans":
     show_my_plans_page()
     st.stop()
@@ -1219,18 +1754,17 @@ if st.session_state.page == "daily_checkin":
     st.stop()
 
 
-
-st.set_page_config(
-    page_title="Accountability Goal Tracker",
-    page_icon="✅",
-    layout="wide"
-)
-
+# -----------------------------
+# Goal Setup page
+# -----------------------------
 show_feedback_link("top")
 
 st.title("✅ Accountability Goal Tracker")
-st.write("Turn a vague goal into a SMART goal, break it into steps, and track your progress.")
 
+st.write(
+    "Turn a vague goal into a SMART goal, "
+    "break it into steps, and track your progress."
+)
 
 # -----------------------------
 # Step 1: User Goal
@@ -1264,6 +1798,7 @@ if st.button("Generate SMART Suggestions"):
 if st.session_state.smart_suggestions:
     st.header("2. Build Your SMART Goal")
 
+# Copy one AI suggestion into its editable SMART input widget.
 def use_smart_suggestion(field_key):
     input_key = f"input_{field_key}"
     suggestion = st.session_state.smart_suggestions.get(field_key, "")
@@ -1336,6 +1871,7 @@ if st.session_state.smart_suggestions:
                             st.session_state.goal,
                             st.session_state.smart_inputs
                         )
+                        increment_usage(user_id, "plan_generation")
                         st.success("Plan generated.")
                     except Exception as e:
                         st.error(f"Could not generate plan: {e}")
@@ -1461,7 +1997,7 @@ else:
         )
 
         if plan_id:
-            st.session_state.current_plan_id = plan_id
+            set_current_plan_id(plan_id)
             st.success("Plan saved successfully.")
             st.code(plan_id)
 
