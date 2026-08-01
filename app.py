@@ -192,6 +192,12 @@ def init_session_state():
     if "auth_mode" not in st.session_state:
         st.session_state.auth_mode = "Login"
 
+    if "auth_check_complete" not in st.session_state:
+        st.session_state.auth_check_complete = False
+
+    if "auth_restore_attempts" not in st.session_state:
+        st.session_state.auth_restore_attempts = 0
+
 
 
 
@@ -258,6 +264,7 @@ def return_user_to_login(message):
 def handle_login():
     email = st.session_state.get("login_email", "").strip().lower()
     password = st.session_state.get("login_password", "")
+    
 
     if not email or not password:
         st.session_state.login_error = (
@@ -276,6 +283,7 @@ def handle_login():
             st.session_state.session = response.session
             st.session_state.login_error = ""
 
+            st.session_state.auth_restore_attempts = 0
             st.session_state.pop("logout_in_progress", None)
 
             save_auth_cookie(response.session)
@@ -429,6 +437,7 @@ def show_login_page():
                             st.session_state.user = response.user
                             st.session_state.session = response.session
 
+                            st.session_state.auth_restore_attempts = 0
                             st.session_state.pop("logout_in_progress", None)
 
                             save_auth_cookie(response.session)
@@ -1647,38 +1656,62 @@ def set_current_plan_id(plan_id):
 init_session_state()
 supabase = get_supabase_client()
 
-# The cookie manager is needed for login, logout, and token updates. At this
-# point any rerun it triggers is safe because restoration has already finished.
+# CookieManager may need one Streamlit render cycle before browser
+# cookies become available through cookie_manager.get().
 cookie_manager = stx.CookieManager(
     key="myg_cookie_manager"
 )
 
-# Restore Supabase before creating the third-party cookie component. The
-# component can trigger an extra Streamlit rerun when the page first loads.
+# -----------------------------------------
+# Restore persistent Supabase authentication
+# -----------------------------------------
 if (
     st.session_state.user is None
     and not st.session_state.get("logout_in_progress", False)
 ):
-    restore_login_from_cookie()
+    restored = restore_login_from_cookie()
+
+    if restored:
+        # Authentication was restored successfully.
+        st.session_state.auth_restore_attempts = 0
+
+    elif st.session_state.auth_restore_attempts < 1:
+        # On the first run, CookieManager may not have loaded
+        # the browser cookies yet. Do not show the login page.
+        st.session_state.auth_restore_attempts += 1
+
+        st.info("Restoring your session...")
+        st.stop()
 
 
-
-# Complete any cookie operation that restoration had to postpone.
-if st.session_state.pop("pending_auth_cookie_delete", False):
+# -----------------------------------------
+# Complete postponed cookie operations
+# -----------------------------------------
+if st.session_state.pop(
+    "pending_auth_cookie_delete",
+    False
+):
     delete_auth_cookie()
 
 pending_cookie_session = st.session_state.pop(
     "pending_auth_cookie_session",
-    None,
+    None
 )
+
 if pending_cookie_session is not None:
     save_auth_cookie(pending_cookie_session)
 
+
+# -----------------------------------------
+# Show login only after restoration was tried
+# -----------------------------------------
 if st.session_state.user is None:
     show_login_page()
     st.stop()
 
-# Keep the browser cookie updated if Supabase rotates tokens later.
+
+# Keep the browser cookie synchronized if Supabase
+# rotates the access or refresh tokens.
 sync_auth_cookie_from_supabase()
 
 
