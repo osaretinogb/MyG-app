@@ -1495,15 +1495,27 @@ def set_start_page_after_login():
 
 # Read or create today's API-usage counter row.
 def get_today_usage(user_id):
+    """
+    Return today's usage record for the logged-in user.
+
+    If no record exists, create it safely. The upsert uses the
+    unique combination of user_id and usage_date, preventing
+    duplicate-row errors when Streamlit reruns simultaneously.
+    """
+
+    default_usage = {
+        "plan_generations": 0,
+        "plan_regenerations": 0,
+    }
+
     if supabase is None:
-        return {
-            "plan_generations": 0,
-            "plan_regenerations": 0
-        }
+        return default_usage
 
     today = date.today().isoformat()
+
     try:
-        response = (
+        # First, check whether today's row already exists.
+        existing_response = (
             supabase.table("usage_limits")
             .select("*")
             .eq("user_id", user_id)
@@ -1511,35 +1523,52 @@ def get_today_usage(user_id):
             .execute()
         )
 
-        if response.data:
-            return response.data[0]
+        if existing_response.data:
+            return existing_response.data[0]
 
-        insert_response = (
+        # Safely attempt to create today's row.
+        # If another rerun creates it first, ignore the duplicate.
+        (
             supabase.table("usage_limits")
-            .insert({
-                "user_id": user_id,
-                "usage_date": today,
-                "plan_generations": 0,
-                "plan_regenerations": 0
-            })
+            .upsert(
+                {
+                    "user_id": user_id,
+                    "usage_date": today,
+                    "plan_generations": 0,
+                    "plan_regenerations": 0,
+                },
+                on_conflict="user_id,usage_date",
+                ignore_duplicates=True,
+            )
             .execute()
         )
 
-        return insert_response.data[0]
-    
+        # Read the row again, regardless of which rerun created it.
+        final_response = (
+            supabase.table("usage_limits")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("usage_date", today)
+            .single()
+            .execute()
+        )
+
+        if final_response.data:
+            return final_response.data
+
+        return default_usage
+
     except Exception as error:
         if is_auth_session_error(error):
             return_user_to_login(
                 "Your login session expired. "
-                "Please log in again to access your plans."
+                "Please log in again."
             )
 
-        st.error(f"Could not load today's usage: {error}")
-        return {
-            "plan_generations": 0,
-            "plan_regenerations": 0,
-        }
-
+        st.error(
+            f"Could not load today's usage: {error}"
+        )
+        return default_usage
 
 #-------------------------------------------------
 
