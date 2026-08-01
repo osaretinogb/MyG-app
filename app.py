@@ -1156,7 +1156,7 @@ def save_auth_cookie(session):
         path="/",
         expires_at=datetime.now() + timedelta(days=30),
         secure=should_use_secure_cookie(),
-        same_site="strict",
+        same_site="lax",
     )
 
 
@@ -1177,7 +1177,7 @@ def delete_auth_cookie():
         path="/",
         expires_at=datetime.now() - timedelta(days=1),
         secure=should_use_secure_cookie(),
-        same_site="strict",
+        same_site="lax",
     )
 
 #------------------------------------------------
@@ -1194,7 +1194,7 @@ def restore_login_from_cookie():
     if st.session_state.get("user") is not None:
         return True
 
-    raw_cookie = st.context.cookies.get(AUTH_COOKIE_NAME)
+    raw_cookie = cookie_manager.get(AUTH_COOKIE_NAME)
 
     if not raw_cookie:
         return False
@@ -1647,9 +1647,10 @@ def set_current_plan_id(plan_id):
 init_session_state()
 supabase = get_supabase_client()
 
-st.caption(
-    f"Auth cookie detected: "
-    f"{AUTH_COOKIE_NAME in st.context.cookies}"
+# The cookie manager is needed for login, logout, and token updates. At this
+# point any rerun it triggers is safe because restoration has already finished.
+cookie_manager = stx.CookieManager(
+    key="myg_cookie_manager"
 )
 
 # Restore Supabase before creating the third-party cookie component. The
@@ -1660,11 +1661,7 @@ if (
 ):
     restore_login_from_cookie()
 
-# The cookie manager is needed for login, logout, and token updates. At this
-# point any rerun it triggers is safe because restoration has already finished.
-cookie_manager = stx.CookieManager(
-    key="myg_cookie_manager"
-)
+
 
 # Complete any cookie operation that restoration had to postpone.
 if st.session_state.pop("pending_auth_cookie_delete", False):
