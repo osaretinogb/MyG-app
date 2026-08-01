@@ -1647,6 +1647,11 @@ def set_current_plan_id(plan_id):
 init_session_state()
 supabase = get_supabase_client()
 
+st.caption(
+    f"Auth cookie detected: "
+    f"{AUTH_COOKIE_NAME in st.context.cookies}"
+)
+
 # Restore Supabase before creating the third-party cookie component. The
 # component can trigger an extra Streamlit rerun when the page first loads.
 if (
