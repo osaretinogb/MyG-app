@@ -198,6 +198,12 @@ def init_session_state():
     if "auth_restore_attempts" not in st.session_state:
         st.session_state.auth_restore_attempts = 0
 
+    if "autosave_message" not in st.session_state:
+        st.session_state.autosave_message = ""
+
+    if "autosave_error" not in st.session_state:
+        st.session_state.autosave_error = ""
+
 
 
 
@@ -693,6 +699,16 @@ def show_daily_checkin_page():
     st.title("📅 Daily Check-In Page")
     st.info("You are now on the Daily Check-In page. Update your progress below.")
 
+    if st.session_state.get("autosave_message"):
+        st.success(st.session_state.autosave_message)
+
+    if st.session_state.get("autosave_error"):
+        st.warning(
+            f"Autosave failed: {st.session_state.autosave_error}"
+        )
+
+    
+
     if not st.session_state.plan:
         st.warning("No plan found yet. Please create a goal plan first.")
 
@@ -728,26 +744,80 @@ def show_daily_checkin_page():
 
             current_status = step.get("status", "Not Started")
 
+            status_options = [
+                "Not Started",
+                "In Progress",
+                "Completed",
+                "Missed",
+                "Skipped"
+            ]
+
+            if current_status not in status_options:
+                current_status = "Not Started"
+
+            step_number = step.get("step_number", index + 1)
+
+            # Include the plan ID so widget keys stay unique across different plans.
+            plan_key = st.session_state.current_plan_id or "unsaved"
+
+            status_key = f"checkin_status_{plan_key}_{step_number}"
+            notes_key = f"checkin_notes_{plan_key}_{step_number}"
+
+            # Initialize the widgets from the currently loaded plan data.
+            if status_key not in st.session_state:
+                st.session_state[status_key] = current_status
+
+            if notes_key not in st.session_state:
+                st.session_state[notes_key] = step.get("notes", "")
+
             status = st.selectbox(
                 "Status",
-                options=["Not Started", "In Progress", "Completed", "Missed", "Skipped"],
-                index=["Not Started", "In Progress", "Completed", "Missed", "Skipped"].index(current_status)
-                if current_status in ["Not Started", "In Progress", "Completed", "Missed", "Skipped"]
-                else 0,
-                key=f"checkin_status_{index}"
+                options=status_options,
+                key=status_key,
+                on_change=autosave_checkin,
+                args=(index, status_key, notes_key)
             )
 
             notes = st.text_area(
                 "Check-in note",
-                value=step.get("notes", ""),
-                placeholder="Example: I completed this today, I struggled with time, or I need to adjust this step.",
-                key=f"checkin_notes_{index}"
+                placeholder=(
+                    "Example: I completed this today, "
+                    "I struggled with time, or I need to adjust this step."
+                ),
+                key=notes_key,
+                on_change=autosave_checkin,
+                args=(index, status_key, notes_key)
             )
 
+            # Keep the current in-memory plan synchronized with the widgets.
             step["status"] = status
             step["notes"] = notes
 
             updated_steps.append(step)
+            # ---------------------------------
+            # Accountability partner comments
+            # ---------------------------------
+            step_id = step.get("id")
+
+            st.write("DEBUG STEP ID:", step_id)
+
+            if step_id:
+                comments = get_step_comments(step_id)
+
+                if comments:
+                    st.markdown("#### 💬 Accountability")
+
+                    for comment in comments:
+                        author = comment.get("author") or {}
+
+                        author_name = (
+                            author.get("display_name")
+                            or author.get("username")
+                            or "MyG User"
+                        )
+
+                        st.write(f"**{author_name}**")
+                        st.write(comment.get("comment_text", ""))
 
     st.session_state.plan["steps"] = updated_steps
 
@@ -929,6 +999,7 @@ def load_plan_from_supabase(plan_id):
             "today_next_action": plan_data.get("today_next_action", ""),
             "steps": [
                 {
+                    "id": step.get("id"),
                     "step_number": step.get("step_number"),
                     "step_name": step.get("step_name", ""),
                     "description": step.get("description", ""),
@@ -989,6 +1060,545 @@ def delete_plan_from_supabase(plan_id):
         st.error(f"Could not delete your plans: {error}")
         return False
 
+#---------------------------------------------------
+
+# Find another MyG user by exact username.
+
+def search_profile_by_username(username):
+
+    try:
+        cleaned_username = username.strip().lower()
+
+        response = (
+            supabase.table("profiles")
+            .select(
+                "id, username, display_name, bio, avatar_url"
+            )
+            .eq("username", cleaned_username)
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+        return None
+
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. "
+                "Please log in again."
+            )
+
+        st.error(
+            f"Could not search for user: {error}"
+        )
+        return None
+
+#---------------------------------------------------
+
+# Check both directions so users cannot create
+# duplicate/reversed accountability relationships.
+
+def get_existing_partnership(user_a_id, user_b_id):
+    """
+    Check both directions so users cannot create
+    duplicate/reversed accountability relationships.
+    """
+
+    try:
+        response = (
+            supabase.table(
+                "accountability_partnerships"
+            )
+            .select("*")
+            .or_(
+                f"and(requester_id.eq.{user_a_id},"
+                f"recipient_id.eq.{user_b_id}),"
+                f"and(requester_id.eq.{user_b_id},"
+                f"recipient_id.eq.{user_a_id})"
+            )
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+        return None
+
+    except Exception as error:
+        st.error(
+            f"Could not check partnership: {error}"
+        )
+        return None
+    
+#---------------------------------------------------
+
+# Send an accountability partner invitation.
+
+def send_partnership_request(recipient_id):
+    """
+    Send an accountability partner invitation.
+    """
+
+    requester_id = st.session_state.user.id
+
+    if requester_id == recipient_id:
+        st.warning(
+            "You cannot invite yourself as an "
+            "accountability partner."
+        )
+        return False
+
+    existing = get_existing_partnership(
+        requester_id,
+        recipient_id
+    )
+
+    if existing:
+        status = existing.get("status")
+
+        if status == "accepted":
+            st.info(
+                "You are already accountability partners."
+            )
+
+        elif status == "pending":
+            st.info(
+                "There is already a pending request "
+                "between you and this user."
+            )
+
+        elif status == "declined":
+            st.info(
+                "A previous accountability request "
+                "between you and this user was declined."
+            )
+
+        return False
+
+    try:
+        response = (
+            supabase.table(
+                "accountability_partnerships"
+            )
+            .insert({
+                "requester_id": requester_id,
+                "recipient_id": recipient_id,
+                "status": "pending",
+            })
+            .execute()
+        )
+
+        return bool(response.data)
+
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. "
+                "Please log in again."
+            )
+
+        st.error(
+            f"Could not send request: {error}"
+        )
+        return False
+
+#---------------------------------------------------
+
+# Get pending invitations sent to the logged-in user.
+
+def get_incoming_partner_requests():
+    """
+    Get pending invitations sent to the logged-in user.
+    """
+
+    user_id = st.session_state.user.id
+
+    try:
+        response = (
+            supabase.table(
+                "accountability_partnerships"
+            )
+            .select(
+                """
+                id,
+                requester_id,
+                recipient_id,
+                status,
+                created_at,
+                requester:profiles!accountability_partnerships_requester_id_fkey(
+                    username,
+                    display_name,
+                    bio
+                )
+                """
+            )
+            .eq("recipient_id", user_id)
+            .eq("status", "pending")
+            .order("created_at", desc=True)
+            .execute()
+        )
+
+        return response.data or []
+
+    except Exception as error:
+        st.error(
+            f"Could not load requests: {error}"
+        )
+        return []
+
+#---------------------------------------------------
+
+# Accept or decline an accountability invitation.
+
+def respond_to_partner_request(
+    partnership_id,
+    new_status
+):
+
+    if new_status not in [
+        "accepted",
+        "declined"
+    ]:
+        return False
+
+    try:
+        response = (
+            supabase.table(
+                "accountability_partnerships"
+            )
+            .update({
+                "status": new_status,
+                "updated_at": datetime.utcnow().isoformat(),
+            })
+            .eq("id", partnership_id)
+            .eq(
+                "recipient_id",
+                st.session_state.user.id
+            )
+            .execute()
+        )
+
+        return bool(response.data)
+
+    except Exception as error:
+        st.error(
+            f"Could not update request: {error}"
+        )
+        return False
+
+#---------------------------------------------------
+
+# Return all accepted partnerships for the current user.
+
+def get_accountability_partners():
+
+    user_id = st.session_state.user.id
+
+    try:
+        response = (
+            supabase.table(
+                "accountability_partnerships"
+            )
+            .select("*")
+            .eq("status", "accepted")
+            .or_(
+                f"requester_id.eq.{user_id},"
+                f"recipient_id.eq.{user_id}"
+            )
+            .execute()
+        )
+
+        partnerships = response.data or []
+        partners = []
+
+        for relationship in partnerships:
+            if relationship["requester_id"] == user_id:
+                partner_id = relationship["recipient_id"]
+            else:
+                partner_id = relationship["requester_id"]
+
+            profile_response = (
+                supabase.table("profiles")
+                .select(
+                    "id, username, display_name, bio, avatar_url"
+                )
+                .eq("id", partner_id)
+                .single()
+                .execute()
+            )
+
+            if profile_response.data:
+                partner = profile_response.data
+                partner["partnership_id"] = relationship["id"]
+
+                partners.append(partner)
+
+        return partners
+
+    except Exception as error:
+        st.error(
+            f"Could not load accountability partners: {error}"
+        )
+        return []
+
+#---------------------------------------------------
+
+# Load one user's public MyG profile.
+
+def get_user_profile(user_id):
+
+    try:
+        response = (
+            supabase.table("profiles")
+            .select("*")
+            .eq("id", user_id)
+            .single()
+            .execute()
+        )
+
+        return response.data
+
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. "
+                "Please log in again."
+            )
+
+        st.error(
+            f"Could not load profile: {error}"
+        )
+        return None
+
+#---------------------------------------------------
+
+# Save changes to the logged-in user's profile.
+
+def update_user_profile(
+    user_id,
+    username,
+    display_name,
+    bio
+):
+
+    try:
+        response = (
+            supabase.table("profiles")
+            .update({
+                "username": username,
+                "display_name": display_name,
+                "bio": bio,
+                "updated_at": datetime.utcnow().isoformat(),
+            })
+            .eq("id", user_id)
+            .execute()
+        )
+
+        return bool(response.data)
+
+    except Exception as error:
+        if "duplicate key" in str(error).lower():
+            st.error(
+                "That username is already taken. "
+                "Please choose another one."
+            )
+            return False
+
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. "
+                "Please log in again."
+            )
+
+        st.error(
+            f"Could not update profile: {error}"
+        )
+        return False
+
+#---------------------------------------------------
+
+# Allow the logged-in user to view and edit
+# their public MyG identity.
+
+def show_profile_page():
+
+    show_feedback_link("top")
+
+    st.title("👤 My Profile")
+
+    profile = get_user_profile(
+        st.session_state.user.id
+    )
+
+    if not profile:
+        st.error(
+            "Your profile could not be loaded."
+        )
+        return
+
+    st.caption(
+        "Your profile is used for accountability "
+        "partner invitations and social features."
+    )
+
+    username = st.text_input(
+        "Username",
+        value=profile.get("username") or "",
+        max_chars=30,
+        placeholder="Example: osaretin"
+    )
+
+    st.caption(
+        "Your username must be unique. "
+        "Other users will eventually use it to find you."
+    )
+
+    display_name = st.text_input(
+        "Display Name",
+        value=profile.get("display_name") or "",
+        max_chars=60,
+        placeholder="Example: Osaretin"
+    )
+
+    bio = st.text_area(
+        "Bio",
+        value=profile.get("bio") or "",
+        max_chars=250,
+        placeholder=(
+            "Tell your accountability partners "
+            "a little about yourself."
+        )
+    )
+
+    if st.button(
+        "Save Profile",
+        type="primary"
+    ):
+        cleaned_username = (
+            username.strip().lower()
+        )
+
+        if len(cleaned_username) < 3:
+            st.warning(
+                "Username must contain at least "
+                "3 characters."
+            )
+
+        elif not re.fullmatch(
+            r"[a-z0-9_]+",
+            cleaned_username
+        ):
+            st.warning(
+                "Username can only contain lowercase "
+                "letters, numbers, and underscores."
+            )
+
+        elif not display_name.strip():
+            st.warning(
+                "Please enter a display name."
+            )
+
+        else:
+            saved = update_user_profile(
+                st.session_state.user.id,
+                cleaned_username,
+                display_name.strip(),
+                bio.strip()
+            )
+
+            if saved:
+                st.success(
+                    "Profile saved successfully."
+                )
+
+    show_feedback_link("bottom")
+
+#---------------------------------------------------
+
+# Automatically saves one Progress Tracker step to Supabase.
+
+def autosave_single_step(plan_id, step_number, status, notes):
+
+    if supabase is None or not plan_id:
+        return False
+
+    try:
+        (
+            supabase.table("plan_steps")
+            .update({
+                "status": status,
+                "notes": notes,
+                "updated_at": datetime.utcnow().isoformat()
+            })
+            .eq("plan_id", plan_id)
+            .eq("step_number", step_number)
+            .execute()
+        )
+
+        return True
+
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. "
+                "Please log in again."
+            )
+
+        st.session_state.autosave_error = str(error)
+        return False
+
+
+#--------------------------------------------------
+
+#  Reads the current Progress Tracker widget values, 
+# updates session state, and saves them to Supabase
+
+def autosave_checkin(step_index, status_key, notes_key):
+
+    if not st.session_state.plan:
+        return
+
+    if not st.session_state.current_plan_id:
+        return
+
+    steps = st.session_state.plan.get("steps", [])
+
+    if step_index >= len(steps):
+        return
+
+    step = steps[step_index]
+
+    status = st.session_state.get(
+        status_key,
+        step.get("status", "Not Started")
+    )
+
+    notes = st.session_state.get(
+        notes_key,
+        step.get("notes", "")
+    )
+
+    # Update the copy in Streamlit memory.
+    step["status"] = status
+    step["notes"] = notes
+    st.session_state.plan["steps"][step_index] = step
+
+    # Permanently save this one step.
+    saved = autosave_single_step(
+        st.session_state.current_plan_id,
+        step.get("step_number", step_index + 1),
+        status,
+        notes
+    )
+
+    if saved:
+        st.session_state.autosave_message = "Saved automatically."
+        st.session_state.autosave_error = ""
+    else:
+        st.session_state.autosave_message = ""
+
 #--------------------------------------------------
 
 # Update a plan and replace its saved step rows.
@@ -1042,6 +1652,348 @@ def update_existing_plan_in_supabase(plan_id, plan):
         st.error(f"Could not load your plans: {error}")
         return False
 
+#---------------------------------------------------
+# Share one of the logged-in user's plans with
+# an accepted accountability partner.
+
+def share_plan_with_partner(plan_id, partner_id):
+
+    user_id = st.session_state.user.id
+
+    try:
+        response = (
+            supabase.table("plan_shares")
+            .upsert(
+                {
+                    "plan_id": plan_id,
+                    "owner_id": user_id,
+                    "partner_id": partner_id,
+                    "can_comment": True,
+                    "can_react": True,
+                },
+                on_conflict="plan_id,partner_id"
+            )
+            .execute()
+        )
+
+        return bool(response.data)
+
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. "
+                "Please log in again."
+            )
+
+        st.error(
+            f"Could not share plan: {error}"
+        )
+        return False
+#---------------------------------------------------
+# Return the accountability partners who currently
+# have access to a specific plan.
+
+def get_plan_shares(plan_id):
+    """
+    Return the accountability partners who currently
+    have access to a specific plan.
+    """
+
+    try:
+        response = (
+            supabase.table("plan_shares")
+            .select(
+                """
+                id,
+                partner_id,
+                can_comment,
+                can_react,
+                partner:profiles!plan_shares_partner_id_fkey(
+                    id,
+                    username,
+                    display_name
+                )
+                """
+            )
+            .eq("plan_id", plan_id)
+            .execute()
+        )
+
+        return response.data or []
+
+    except Exception as error:
+        st.error(
+            f"Could not load plan sharing information: {error}"
+        )
+        return []
+
+#---------------------------------------------------
+# Stop sharing a plan with an accountability partner.
+
+def remove_plan_share(share_id):
+    """
+    Stop sharing a plan with an accountability partner.
+    """
+
+    try:
+        response = (
+            supabase.table("plan_shares")
+            .delete()
+            .eq("id", share_id)
+            .execute()
+        )
+
+        return bool(response.data)
+
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. "
+                "Please log in again."
+            )
+
+        st.error(
+            f"Could not stop sharing plan: {error}"
+        )
+        return False
+
+#---------------------------------------------------
+# load plans shared with the logged-in user
+
+def get_plans_shared_with_me():
+    """
+    Return plans explicitly shared with the logged-in user.
+
+    This deliberately loads the share, plan, and owner profile
+    separately so the logic is easier to understand and debug.
+    """
+
+    user_id = st.session_state.user.id
+
+    try:
+        # 1. Find shares where the logged-in user is the partner.
+        shares_response = (
+            supabase.table("plan_shares")
+            .select("*")
+            .eq("partner_id", user_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+
+        shares = shares_response.data or []
+
+        shared_plans = []
+
+        # 2. Load the corresponding plan and owner for each share.
+        for share in shares:
+
+            plan_response = (
+                supabase.table("plans")
+                .select(
+                    "id, goal_summary, overall_deadline, "
+                    "likely_obstacle, today_next_action, created_at"
+                )
+                .eq("id", share["plan_id"])
+                .execute()
+            )
+
+            if not plan_response.data:
+                continue
+
+            owner_response = (
+                supabase.table("profiles")
+                .select(
+                    "id, username, display_name"
+                )
+                .eq("id", share["owner_id"])
+                .execute()
+            )
+
+            owner = (
+                owner_response.data[0]
+                if owner_response.data
+                else {}
+            )
+
+            plan = plan_response.data[0]
+
+            # Preserve the structure expected by
+            # show_shared_plans_page().
+            share["plan"] = plan
+            share["owner"] = owner
+
+            shared_plans.append(share)
+
+        return shared_plans
+
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. "
+                "Please log in again."
+            )
+
+        st.error(
+            f"Could not load shared plans: {error}"
+        )
+        return []
+
+#---------------------------------------------------
+# load one shared plan with its steps
+
+def load_shared_plan(plan_id):
+    """
+    Load a plan and its steps when the current user
+    has permission through plan_shares.
+    """
+
+    try:
+        plan_response = (
+            supabase.table("plans")
+            .select("*")
+            .eq("id", plan_id)
+            .single()
+            .execute()
+        )
+
+        steps_response = (
+            supabase.table("plan_steps")
+            .select("*")
+            .eq("plan_id", plan_id)
+            .order("step_number")
+            .execute()
+        )
+
+        if not plan_response.data:
+            return None
+
+        plan = plan_response.data
+        plan["steps"] = steps_response.data or []
+
+        return plan
+
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. "
+                "Please log in again."
+            )
+
+        st.error(
+            f"Could not load shared plan: {error}"
+        )
+        return None
+
+def add_step_comment(plan_id, step_id, comment_text):
+    """
+    Add a comment to a specific step of a shared plan.
+    """
+
+    comment_text = comment_text.strip()
+
+    if not comment_text:
+        return False
+
+    if len(comment_text) > 1000:
+        st.warning("Comments cannot exceed 1,000 characters.")
+        return False
+
+    try:
+        response = (
+            supabase.table("step_comments")
+            .insert({
+                "plan_id": plan_id,
+                "step_id": step_id,
+                "author_id": st.session_state.user.id,
+                "comment_text": comment_text,
+            })
+            .execute()
+        )
+
+        return bool(response.data)
+
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. Please log in again."
+            )
+
+        st.error(f"Could not post comment: {error}")
+        return False
+
+
+def get_step_comments(step_id):
+    """
+    Return comments for a particular plan step,
+    oldest comment first.
+    """
+
+    try:
+        response = (
+            supabase.table("step_comments")
+            .select(
+                """
+                id,
+                step_id,
+                plan_id,
+                author_id,
+                comment_text,
+                created_at,
+                author:profiles!step_comments_author_id_fkey(
+                    id,
+                    username,
+                    display_name
+                )
+                """
+            )
+            .eq("step_id", step_id)
+            .order("created_at")
+            .execute()
+        )
+
+        return response.data or []
+
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. Please log in again."
+            )
+
+        st.error(f"Could not load comments: {error}")
+        return []
+
+
+def delete_step_comment(comment_id):
+    """
+    Delete a comment written by the logged-in user.
+    RLS prevents users from deleting someone else's comment.
+    """
+
+    try:
+        response = (
+            supabase.table("step_comments")
+            .delete()
+            .eq("id", comment_id)
+            .eq(
+                "author_id",
+                st.session_state.user.id
+            )
+            .execute()
+        )
+
+        return bool(response.data)
+
+    except Exception as error:
+        if is_auth_session_error(error):
+            return_user_to_login(
+                "Your login session expired. Please log in again."
+            )
+
+        st.error(f"Could not delete comment: {error}")
+        return False
+
+
+         
 #---------------------------------------------------
 # Persistent authentication: encrypted browser-cookie management
 #------------------------------------------------
@@ -1376,6 +2328,424 @@ def get_user_plans(user_id):
         return []
 
 #------------------------------------------
+# Partner View Page
+
+def show_shared_plans_page():
+    """
+    Shows plans that other users have explicitly shared
+    with the logged-in accountability partner.
+    """
+
+    show_feedback_link("top")
+
+    st.title("👀 Plans Shared With Me")
+
+    shared_plans = get_plans_shared_with_me()
+
+    if not shared_plans:
+        st.info(
+            "No accountability plans have been shared with you yet."
+        )
+        show_feedback_link("bottom")
+        return
+
+    for share in shared_plans:
+        owner = share.get("owner") or {}
+        plan = share.get("plan") or {}
+
+        owner_name = (
+            owner.get("display_name")
+            or owner.get("username")
+            or "MyG User"
+        )
+
+        st.subheader(
+            plan.get("goal_summary", "Untitled Plan")
+        )
+
+        st.caption(
+            f"Shared by {owner_name}"
+        )
+
+        st.write(
+            f"**Deadline:** "
+            f"{plan.get('overall_deadline', 'No deadline')}"
+        )
+
+        st.write(
+            f"**Next Action:** "
+            f"{plan.get('today_next_action', 'No next action')}"
+        )
+
+        if st.button(
+            "Open Shared Plan",
+            key=f"open_shared_{share['id']}"
+        ):
+            loaded_plan = load_shared_plan(
+                plan["id"]
+            )
+
+            if loaded_plan:
+                st.session_state.shared_plan = loaded_plan
+                st.session_state.shared_plan_share = share
+
+                set_current_page("shared_plan_view")
+                st.rerun()
+
+        st.markdown("---")
+
+    show_feedback_link("bottom")
+
+#------------------------------------------
+# Read-Only View of a Shared Plan
+
+def show_shared_plan_view():
+    """
+    Read-only view of a plan shared with the current partner.
+    """
+
+    show_feedback_link("top")
+
+    plan = st.session_state.get("shared_plan")
+    share = st.session_state.get("shared_plan_share")
+
+    if not plan or not share:
+        st.warning(
+            "No shared plan is currently selected."
+        )
+
+        if st.button("Back to Shared Plans"):
+            set_current_page("shared_plans")
+            st.rerun()
+
+        return
+
+    st.title("🤝 Shared Accountability Plan")
+
+    st.subheader(plan.get("goal_summary", "Untitled Plan"))
+
+    st.write(
+        f"**Deadline:** "
+        f"{plan.get('overall_deadline', 'No deadline')}"
+    )
+
+    st.write(
+        f"**Likely Obstacle:** "
+        f"{plan.get('likely_obstacle', '')}"
+    )
+
+    st.write(
+        f"**Today's Next Action:** "
+        f"{plan.get('today_next_action', '')}"
+    )
+
+    st.markdown("---")
+    st.subheader("Plan Steps")
+
+    for step in plan.get("steps", []):
+        step_id = step.get("id")
+
+        st.write(
+            f"### Step {step.get('step_number')}: "
+            f"{step.get('step_name', 'Untitled Step')}"
+        )
+
+        st.write(
+            f"**Description:** "
+            f"{step.get('description', '')}"
+        )
+
+        st.write(
+            f"**Time Block:** "
+            f"{step.get('time_block', '')}"
+        )
+
+        st.write(
+            f"**Deadline:** "
+            f"{step.get('deadline', '')}"
+        )
+
+        st.write(
+            f"**Status:** "
+            f"{step.get('status', 'Not Started')}"
+        )
+
+        if step.get("notes"):
+            st.write(
+                f"**Latest Check-In:** "
+                f"{step.get('notes')}"
+            )
+
+        # ---------------------------------
+        # Accountability comments
+        # ---------------------------------
+        st.markdown("#### 💬 Accountability")
+
+        comments = get_step_comments(step_id)
+
+        if not comments:
+            st.caption("No comments yet.")
+
+        for comment in comments:
+            author = comment.get("author") or {}
+
+            author_name = (
+                author.get("display_name")
+                or author.get("username")
+                or "MyG User"
+            )
+
+            st.write(f"**{author_name}**")
+            st.write(comment.get("comment_text", ""))
+
+            # Only show Delete for comments written
+            # by the currently logged-in user.
+            if (
+                comment.get("author_id")
+                == st.session_state.user.id
+            ):
+                if st.button(
+                    "Delete",
+                    key=f"delete_comment_{comment['id']}"
+                ):
+                    deleted = delete_step_comment(
+                        comment["id"]
+                    )
+
+                    if deleted:
+                        st.rerun()
+
+        # ---------------------------------
+        # New comment form
+        # ---------------------------------
+        if share.get("can_comment", False):
+
+            with st.form(
+                f"comment_form_{step_id}",
+                clear_on_submit=True
+            ):
+                comment_text = st.text_area(
+                    "Add a comment",
+                    placeholder=(
+                        "Write some encouragement, advice, "
+                        "or accountability feedback..."
+                    ),
+                    max_chars=1000
+                )
+
+                comment_submitted = st.form_submit_button(
+                    "Post Comment"
+                )
+
+            if comment_submitted:
+                if not comment_text.strip():
+                    st.warning(
+                        "Please write a comment before posting."
+                    )
+
+                else:
+                    posted = add_step_comment(
+                        plan["id"],
+                        step_id,
+                        comment_text
+                    )
+
+                    if posted:
+                        st.success("Comment posted.")
+                        st.rerun()
+
+        else:
+            st.caption(
+                "Comments are disabled for this shared plan."
+            )
+
+        st.markdown("---")
+
+    if st.button("Back to Shared Plans"):
+        set_current_page("shared_plans")
+        st.rerun()
+
+    show_feedback_link("bottom")
+
+#------------------------------------------
+
+# Social hub for accountability partnerships.
+
+def show_partners_page():
+
+    show_feedback_link("top")
+
+    st.title("🤝 Accountability Partners")
+
+    st.write(
+        "Connect with someone you trust to help "
+        "support and encourage your progress."
+    )
+
+
+    # ---------------------------------
+    # Find another MyG user
+    # ---------------------------------
+    st.subheader("Find a Partner")
+
+    username_search = st.text_input(
+        "Search by username",
+        placeholder="Example: osaretin"
+    )
+
+    if st.button("Search User"):
+        if not username_search.strip():
+            st.warning(
+                "Enter a username first."
+            )
+
+        else:
+            profile = search_profile_by_username(
+                username_search
+            )
+
+            if not profile:
+                st.info(
+                    "No user was found with that username."
+                )
+
+            elif (
+                profile["id"]
+                == st.session_state.user.id
+            ):
+                st.info(
+                    "That's your own profile."
+                )
+
+            else:
+                st.session_state[
+                    "partner_search_result"
+                ] = profile
+
+
+    profile = st.session_state.get(
+        "partner_search_result"
+    )
+
+    if profile:
+        st.markdown("---")
+
+        st.write(
+            f"### {profile.get('display_name') or profile.get('username')}"
+        )
+
+        st.write(
+            f"@{profile.get('username', '')}"
+        )
+
+        if profile.get("bio"):
+            st.write(profile["bio"])
+
+        if st.button(
+            "Send Accountability Request",
+            type="primary"
+        ):
+            sent = send_partnership_request(
+                profile["id"]
+            )
+
+            if sent:
+                st.success(
+                    "Accountability partner request sent!"
+                )
+
+                st.session_state.pop(
+                    "partner_search_result",
+                    None
+                )
+
+
+    # ---------------------------------
+    # Incoming requests
+    # ---------------------------------
+    st.markdown("---")
+    st.subheader("Partner Requests")
+
+    requests = get_incoming_partner_requests()
+
+    if not requests:
+        st.caption(
+            "You have no pending partner requests."
+        )
+
+    for request in requests:
+        requester = request.get(
+            "requester",
+            {}
+        ) or {}
+
+        st.write(
+            f"**{requester.get('display_name') or requester.get('username', 'MyG User')}**"
+        )
+
+        st.caption(
+            f"@{requester.get('username', '')}"
+        )
+
+        col_accept, col_decline = st.columns(2)
+
+        with col_accept:
+            if st.button(
+                "Accept",
+                key=f"accept_{request['id']}",
+                type="primary"
+            ):
+                if respond_to_partner_request(
+                    request["id"],
+                    "accepted"
+                ):
+                    st.success(
+                        "Accountability partnership accepted!"
+                    )
+                    st.rerun()
+
+        with col_decline:
+            if st.button(
+                "Decline",
+                key=f"decline_{request['id']}"
+            ):
+                if respond_to_partner_request(
+                    request["id"],
+                    "declined"
+                ):
+                    st.rerun()
+
+
+    # ---------------------------------
+    # Existing partners
+    # ---------------------------------
+    st.markdown("---")
+    st.subheader("My Accountability Partners")
+
+    partners = get_accountability_partners()
+
+    if not partners:
+        st.caption(
+            "You do not have an accountability partner yet."
+        )
+
+    for partner in partners:
+        st.write(
+            f"### {partner.get('display_name') or partner.get('username')}"
+        )
+
+        st.caption(
+            f"@{partner.get('username', '')}"
+        )
+
+        if partner.get("bio"):
+            st.write(partner["bio"])
+
+        st.markdown("---")
+
+    show_feedback_link("bottom")
+
+#------------------------------------------
 
 # Render saved plans and actions to open, modify, or delete them.
 def show_my_plans_page():
@@ -1482,9 +2852,85 @@ def show_my_plans_page():
                             st.success("Plan deleted.")
                             st.rerun()
 
+            # ---------------------------------
+            # Accountability plan sharing
+            # ---------------------------------
+            st.markdown("#### 🤝 Accountability")
+
+            partners = get_accountability_partners()
+
+            if not partners:
+                st.caption(
+                    "Add an accountability partner before sharing this plan."
+                )
+
+            else:
+                partner_options = {
+                    (
+                        partner.get("display_name")
+                        or partner.get("username")
+                        or "MyG User"
+                    ): partner
+                    for partner in partners
+                }
+
+                selected_partner_name = st.selectbox(
+                    "Share this plan with",
+                    list(partner_options.keys()),
+                    key=f"share_partner_{plan['id']}"
+                )
+
+                selected_partner = partner_options[selected_partner_name]
+
+                if st.button(
+                    "Share Plan",
+                    key=f"share_plan_{plan['id']}"
+                ):
+                    shared = share_plan_with_partner(
+                        plan["id"],
+                        selected_partner["id"]
+                    )
+
+                    if shared:
+                        st.success(
+                            f"Plan shared with {selected_partner_name}."
+                        )
+                        
+
+            current_shares = get_plan_shares(plan["id"])
+
+            if current_shares:
+                st.caption("Currently shared with:")
+
+                for share in current_shares:
+                    partner = share.get("partner") or {}
+
+                    partner_name = (
+                        partner.get("display_name")
+                        or partner.get("username")
+                        or "MyG User"
+                    )
+
+                    col_name, col_remove = st.columns([3, 1])
+
+                    with col_name:
+                        st.write(f"🤝 {partner_name}")
+
+                    with col_remove:
+                        if st.button(
+                            "Remove",
+                            key=f"remove_share_{share['id']}"
+                        ):
+                            removed = remove_plan_share(
+                                share["id"]
+                            )
+
+                            if removed:
+                                st.rerun()
+
             st.markdown("---")
 
-    show_feedback_link("bottom")
+
 
 #-------------------------------------------
 
@@ -1623,11 +3069,28 @@ VALID_PAGES = {
     "my_plans",
     "goal_setup",
     "daily_checkin",
+    "profile",
+    "partners",
+    "shared_plans",
+    "shared_plan_view",
+    "Shared With Me",
 }
 
+PAGE_TO_SIDEBAR = {
+    "my_plans": "My Plans",
+    "goal_setup": "Create New Plan",
+    "daily_checkin": "Progress Tracker",
+    "partners": "Accountability Partners",
+    "shared_plans": "Shared With Me",
+    "shared_plan_view": "Shared With Me",
+    "profile": "Profile",
+}
 
 def set_current_page(page_name):
-    """Update the app's page in Session State and in the browser URL."""
+    """
+    Update the app's current page and browser URL.
+    """
+
     if page_name not in VALID_PAGES:
         page_name = "my_plans"
 
@@ -1755,28 +3218,46 @@ if st.sidebar.button("Logout"):
     logout_user()
 
 
-selected_page = st.sidebar.radio(
-    "Go to",
-    ["My Plans", "Create New Plan", "Progress Tracker"],
-    index=(
-        0 if st.session_state.page == "my_plans"
-        else 1 if st.session_state.page == "goal_setup"
-        else 2
-    )
+# -----------------------------------------
+# Sidebar navigation
+# -----------------------------------------
+
+PAGE_LABELS = {
+    "My Plans": "my_plans",
+    "Create New Plan": "goal_setup",
+    "Progress Tracker": "daily_checkin",
+    "Accountability Partners": "partners",
+    "Shared With Me": "shared_plans",
+    "Profile": "profile",
+}
+
+PAGE_NAMES = {
+    page_name: label
+    for label, page_name in PAGE_LABELS.items()
+}
+
+# shared_plan_view is a child page of Shared With Me.
+sidebar_page = st.session_state.page
+
+if sidebar_page == "shared_plan_view":
+    sidebar_page = "shared_plans"
+
+current_label = PAGE_NAMES.get(
+    sidebar_page,
+    "My Plans"
 )
 
+selected_page = st.sidebar.radio(
+    "Go to",
+    list(PAGE_LABELS.keys()),
+    index=list(PAGE_LABELS.keys()).index(current_label)
+)
 
-# Update both session state and the URL.
-if selected_page == "My Plans":
-    set_current_page("my_plans")
+selected_page_name = PAGE_LABELS[selected_page]
 
-elif selected_page == "Create New Plan":
-    set_current_page("goal_setup")
-
-else:
-    set_current_page("daily_checkin")
-
-
+if selected_page_name != sidebar_page:
+    set_current_page(selected_page_name)
+    st.rerun()
 # -----------------------------
 # Daily usage
 # -----------------------------
@@ -1817,6 +3298,21 @@ if st.session_state.page == "daily_checkin":
     show_daily_checkin_page()
     st.stop()
 
+if st.session_state.page == "partners":
+    show_partners_page()
+    st.stop()
+
+if st.session_state.page == "profile":
+    show_profile_page()
+    st.stop()
+
+if st.session_state.page == "shared_plans":
+    show_shared_plans_page()
+    st.stop()
+
+if st.session_state.page == "shared_plan_view":
+    show_shared_plan_view()
+    st.stop()
 
 # -----------------------------
 # Goal Setup page
@@ -1837,20 +3333,23 @@ st.header("1. What goal are you trying to achieve?")
 
 goal = st.text_area(
     "Enter your goal",
-    value=st.session_state.goal,
-    placeholder="Example: I want to lose weight, build my business, study better, or save money.",
-    max_chars= MAX_GOAL_CHARACTERS
-    )
+    key="goal",
+    placeholder=(
+        "Example: I want to lose weight, build my business, "
+        "study better, or save money."
+    ),
+    max_chars=None
+)
 
 if st.button("Generate SMART Suggestions"):
     if not goal.strip():
         st.warning("Please enter a goal first.")
     else:
-        st.session_state.goal = goal.strip()
+        # st.session_state.goal = goal.strip()
 
         with st.spinner("Generating SMART suggestions..."):
             try:
-                st.session_state.smart_suggestions = generate_smart_suggestions(st.session_state.goal)
+                st.session_state.smart_suggestions = generate_smart_suggestions(goal.strip())
                 st.success("SMART suggestions generated.")
             except Exception as e:
                 st.error(f"Could not generate SMART suggestions: {e}")
