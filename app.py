@@ -799,8 +799,6 @@ def show_daily_checkin_page():
             # ---------------------------------
             step_id = step.get("id")
 
-            st.write("DEBUG STEP ID:", step_id)
-
             if step_id:
                 comments = get_step_comments(step_id)
 
